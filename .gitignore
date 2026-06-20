@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# Сгенерированные артефакты тестов/дебага (пишутся в cwd, не хранить)
+debug_result.png
+debug_green_mask.png
+debug_brown_mask.png
+before.png
+after.png
+dbg_*.png
