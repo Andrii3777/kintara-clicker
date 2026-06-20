@@ -1,36 +1,36 @@
 # -*- coding: utf-8 -*-
 """
-tree-4x/bot.py
-==============
-Авто-кликер деревьев на 4 АККАУНТА одновременно. Экран = 4 окна игры,
+stone-coal-4x/bot.py
+====================
+Авто-кликер камня+угля на 4 АККАУНТА одновременно. Экран = 4 окна игры,
 разложенные «плиткой» 2x2 в квадрантах выбранного монитора (каждый квадрант =
 свой логин/мир).
 
 ПОЧЕМУ ТАК (ключевой принцип):
   Курсор в системе ОДИН (win_input = SendInput, абсолютные координаты
   виртуального стола). 4 бота не могут двигать его одновременно. НО почти всё
-  время бот ЖДЁТ (перс идёт + рубит, до HARD_CAP сек). Пока акк-0 ждёт глоу,
-  курсор свободен -> кликаем акк-1, акк-2, акк-3. Получаем ~4x за счёт
-  ИНТЕРЛИВИНГА пауз, а не за счёт второго курсора.
+  время бот ЖДЁТ (перс идёт + добывает, до HARD_CAP сек). Пока акк-0 ждёт, курсор
+  свободен -> кликаем акк-1, акк-2, акк-3. Получаем ~4x за счёт ИНТЕРЛИВИНГА
+  пауз, а не за счёт второго курсора.
 
 Как реализовано:
-  - Каждый аккаунт = конечный автомат (FSM): SCAN -> WAIT_APPEAR -> WAIT_VANISH
-    -> (chopped) -> SCAN, либо -> PAN если целей нет.
-  - Планировщик (scheduler) по кругу даёт каждому аккаунту ОДИН «тик»: максимум
-    один захват региона + максимум одно действие мышью (клик ИЛИ один шаг пана).
-    Блокирующего ожидания нет -> аккаунты не держат друг друга.
-  - Все дедлайны по time.time() (не по итерациям) -> интерливинг их не ломает.
+  - Каждый аккаунт = конечный автомат (FSM): SCAN -> WAIT_ENGAGE -> WAIT_RECOVER
+    -> (mined) -> SCAN, либо -> PAN если целей нет.
+  - Планировщик по кругу даёт каждому аккаунту ОДИН «тик»: максимум один захват
+    региона + максимум одно действие мышью. Блокирующего ожидания нет.
+  - Все дедлайны по time.time() -> интерливинг их не ломает.
+
+ОТЛИЧИЕ ОТ ДЕРЕВА: у камня НЕТ зелёного глоу. Сигнал добычи ИНВЕРТИРОВАН: перс
+встаёт на камень, заслоняет телом -> пиксели камня в зоне ПАДАЮТ (добывает);
+отошёл -> ВЕРНУЛИСЬ (добыто). base = пиксели камня в момент клика.
+  px <= base*ENGAGE_DROP_FRAC -> перс пришёл, ДОБЫВАЕТ
+  px >= base*RECOVER_FRAC      -> ДОБЫТО
 
 Регионы: авто-2x2 квадранты MONITOR_INDEX (см. build_regions).
-
-Детекция/глоу — те же tree_detector.detect_trees / highlight_count, что и в
-одиночном bot.py. Картинка просто меньше (квадрант) -> возможно подкрутить
-пороги площади (см. MIN_CLICK_*).
+Зависимости (НЕ дублируем): stone_detector из ../stone-coal, win_input из ../common.
 
 Стоп: 'q'. DRY_RUN=True — без кликов (FSM крутится на фикс-паузах).
-
-Зависимости (НЕ дублируем): tree_detector из ../tree, win_input из ../common.
-Запуск (из папки tree-4x):  python bot.py
+Запуск (из папки stone-coal-4x):  python bot.py
 """
 
 import time
@@ -41,31 +41,29 @@ import cv2
 import numpy as np
 
 # DPI-aware ПЕРВЫМ делом — до mss/любого захвата.
-# Бутстрап путей: ../common (win_input, общий) и ../tree (tree_detector, ядро CV).
-# Детектор НЕ дублируем — единственный источник в tree/.
+# Бутстрап путей: ../common (win_input, общий) и ../stone-coal (stone_detector).
+# Детектор НЕ дублируем — единственный источник в stone-coal/.
 import os, sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "common"))
-sys.path.insert(0, os.path.join(_HERE, "..", "tree"))
+sys.path.insert(0, os.path.join(_HERE, "..", "stone-coal"))
 import win_input
 win_input.set_dpi_aware()
 
 import keyboard
 
-from tree_detector import detect_trees, highlight_count
+from stone_detector import detect_stones, stone_px
 
 
 # ============================================================
-# CONFIG — крутим тут (значения = как в одиночном bot.py)
+# CONFIG — крутим тут (значения = как в одиночном stone-coal/bot.py)
 # ============================================================
 
 DRY_RUN = False            # True = печать без клика (СНАЧАЛА проверь так!)
 MONITOR_INDEX = 1          # какой монитор делить на 2x2
 
 # --- Раскладка квадрантов ---
-# Авто 2x2 монитора. Поджимаем рамки внутрь на REGION_INSET долю, чтобы НЕ
-# ловить чужой квадрант / границу окна по краю.
-REGION_INSET = 0.0         # 0..0.2; >0 если по краям квадранта мусор
+REGION_INSET = 0.0         # 0..0.2; >0 если по краям квадранта мусор/чужое окно
 
 # Какие квадранты активны (аккаунты). Выключи лишние -> можно гонять 2 или 3 акка.
 # TL=лево-верх, TR=право-верх, BL=лево-низ, BR=право-низ.
@@ -74,18 +72,18 @@ QUADRANT_TR = True
 QUADRANT_BL = True
 QUADRANT_BR = True
 
-# --- Ожидание срубки по ГЛОУ (относительно base) ---
+# --- Ожидание добычи по ПИКСЕЛЯМ КАМНЯ (инвертированный сигнал, без глоу) ---
 CHOP_POLL = 0.2            # целевой интервал между поллами ОДНОГО аккаунта, сек
-TREE_GLOW_R = 40
-NEON_RISE_PX = 180         # глоу >= base+это -> перс дошёл, рубит
-NEON_FALL_PX = 60          # глоу <= base+это -> срублено
+STONE_GLOW_R = 40
+ENGAGE_DROP_FRAC = 0.70    # px <= base*это -> перс взялся, добывает (заслонил)
+RECOVER_FRAC = 0.90        # px >= base*это -> добыто (перс отошёл)
 APPEAR_BASE = 3.0
 WALK_SEC_PER_PX = 0.020
 APPEAR_MAX = 6.0
 VANISH_CONFIRM = 2
 HARD_CAP = 8.0
 POST_CHOP_PAUSE = (0.1, 0.3)
-DRY_WAIT = 2.0             # в DRY_RUN держим «рубку» столько
+DRY_WAIT = 2.0             # в DRY_RUN держим «добычу» столько
 
 # --- Панорамирование (по диагоналям ромба, как в одиночном боте) ---
 PAN_DIST = 380
@@ -98,12 +96,11 @@ PAN_ROW_START = 'SW'
 PAN_STEP_START = 'SE'
 
 # --- Отбор/выбор цели ---
-# ВНИМАНИЕ: квадрант = 1/4 экрана -> деревья мельче. Пороги площади, возможно,
-# надо уменьшить против одиночного bot.py. Откалибруй на debug-кадре квадранта.
-MIN_CLICK_TRUNK_AREA = 12
-MIN_CLICK_CROWN_AREA = 80
+# ВНИМАНИЕ: квадрант = 1/4 экрана -> камни мельче. Порог площади, возможно,
+# надо уменьшить против одиночного бота. Откалибруй на debug-кадре квадранта.
+MIN_CLICK_STONE_AREA = 200
 CHAR_ANCHOR = (0.42, 0.40)   # доли ВНУТРИ квадранта (перс ~ центр окна)
-SAME_TREE_R = 18
+SAME_STONE_R = 18
 COOLDOWN_SEC = 12.0
 BLACKLIST_TTL = 45.0
 
@@ -130,7 +127,7 @@ def build_regions():
     """
     Разбить MONITOR_INDEX на 4 квадранта 2x2 и оставить только АКТИВНЫЕ
     (QUADRANT_*). Каждый регион — dict в АБСОЛЮТНЫХ координатах виртуального стола
-    (left/top уже со смещением монитора), как ждёт mss.grab и win_input.
+    (left/top уже со смещением монитора).
     """
     import mss
     with mss.mss() as sct:
@@ -165,26 +162,24 @@ def grab_region(region):
     return cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
 
 
-def pick_confident(trees):
-    return [t for t in trees
-            if t['trunk_area'] >= MIN_CLICK_TRUNK_AREA
-            and t['crown_area'] >= MIN_CLICK_CROWN_AREA]
+def pick_confident(stones):
+    return [s for s in stones if s['area'] >= MIN_CLICK_STONE_AREA]
 
 
-def choose_target(trees, last_pos, anchor_px, recent, blacklist):
-    """Та же логика выбора, что в одиночном боте (см. bot.py.choose_target)."""
+def choose_target(stones, last_pos, anchor_px, recent, blacklist):
+    """Та же логика выбора, что в одиночном боте (см. stone-coal/bot.py)."""
     ref = last_pos if last_pos is not None else anchor_px
 
     def near(p, pts):
-        return any(dist(p, r) < SAME_TREE_R for r in pts)
+        return any(dist(p, r) < SAME_STONE_R for r in pts)
 
-    usable = [t for t in trees if not near(t['click'], blacklist)]
-    cand = [t for t in usable if not near(t['click'], recent)]
+    usable = [s for s in stones if not near(s['click'], blacklist)]
+    cand = [s for s in usable if not near(s['click'], recent)]
     if not cand:
         cand = usable
     if not cand:
         return None
-    return min(cand, key=lambda t: dist(t['click'], ref))
+    return min(cand, key=lambda s: dist(s['click'], ref))
 
 
 # ============================================================
@@ -193,8 +188,8 @@ def choose_target(trees, last_pos, anchor_px, recent, blacklist):
 
 # Состояния FSM
 SCAN = 'SCAN'
-WAIT_APPEAR = 'WAIT_APPEAR'
-WAIT_VANISH = 'WAIT_VANISH'
+WAIT_ENGAGE = 'WAIT_ENGAGE'    # ждём падения px (перс заслонил, добывает)
+WAIT_RECOVER = 'WAIT_RECOVER'  # ждём восстановления px (перс отошёл = добыто)
 DONE = 'DONE'
 
 
@@ -222,12 +217,14 @@ class AccountBot:
         self.t0 = 0.0
         self.appear_deadline = 0.0
         self.hard_deadline = 0.0
-        self.base = 0
-        self.peak = 0
+        self.base = 1
+        self.drop_thr = 0
+        self.recover_thr = 0
+        self.lowest = 0
         self.last = 0
-        self.gone = 0
-        self.resume_at = 0.0     # не сканировать раньше (пауза после срубки)
-        self.last_poll = 0.0     # время последнего полла (троттл CHOP_POLL)
+        self.back = 0
+        self.resume_at = 0.0
+        self.last_poll = 0.0
 
         # пан-обход (счётчики, как в одиночном do_pan)
         self.empty_pans = 0
@@ -239,13 +236,12 @@ class AccountBot:
 
     # -- помощники --
     def _abs(self, local_xy):
-        """Локальная точка региона -> абс. координаты виртуального стола."""
         return (self.region['left'] + local_xy[0],
                 self.region['top'] + local_xy[1])
 
-    def _glow(self, bgr):
+    def _stone_px(self, bgr):
         cx, cy = self.target['click']
-        return highlight_count(bgr, cx, cy, TREE_GLOW_R)
+        return stone_px(bgr, cx, cy, STONE_GLOW_R)
 
     def _expire_memory(self, now):
         self.recent = [(p, t) for (p, t) in self.recent if now - t < COOLDOWN_SEC]
@@ -258,18 +254,18 @@ class AccountBot:
         if self.state == DONE:
             return True
 
-        # троттл: один аккаунт не чаще CHOP_POLL (но другие тикают свободно)
+        # троттл: один аккаунт не чаще CHOP_POLL (другие тикают свободно)
         if now - self.last_poll < CHOP_POLL:
             return False
         self.last_poll = now
 
         if self.state == SCAN:
             return self._tick_scan(now)
-        if self.state == WAIT_APPEAR:
-            self._tick_appear(now)
+        if self.state == WAIT_ENGAGE:
+            self._tick_engage(now)
             return False
-        if self.state == WAIT_VANISH:
-            self._tick_vanish(now)
+        if self.state == WAIT_RECOVER:
+            self._tick_recover(now)
             return False
         return False
 
@@ -281,16 +277,16 @@ class AccountBot:
         H, W = bgr.shape[:2]
         anchor = (int(CHAR_ANCHOR[0] * W), int(CHAR_ANCHOR[1] * H))
 
-        trees, _, _, _ = detect_trees(bgr)
-        trees = pick_confident(trees)
+        stones, _, _, _ = detect_stones(bgr)
+        stones = pick_confident(stones)
 
         recent_pts = [p for (p, _) in self.recent]
         black_pts = [p for (p, _) in self.blacklist]
-        target = choose_target(trees, self.last_pos, anchor,
-                               recent_pts, black_pts) if trees else None
+        target = choose_target(stones, self.last_pos, anchor,
+                               recent_pts, black_pts) if stones else None
 
         if target is None:
-            reason = "нет деревьев" if not trees else "все в чёрном списке"
+            reason = "нет камней" if not stones else "все в чёрном списке"
             return self._do_pan(bgr, reason)
 
         self.empty_pans = 0
@@ -298,9 +294,8 @@ class AccountBot:
         d = 0.0 if self.last_pos is None else dist(self.last_pos, target['click'])
 
         ax, ay = self._abs(target['click'])
-        print(f"[{self.tag} #{self.clicks}] дерево@{target['click']} "
-              f"trunk={target['trunk_area']} crown={target['crown_area']} "
-              f"dist={d:.0f} -> click({ax},{ay})")
+        print(f"[{self.tag} #{self.clicks}] камень@{target['click']} "
+              f"area={target['area']} dist={d:.0f} -> click({ax},{ay})")
 
         if not DRY_RUN:
             win_input.click_abs(ax, ay)
@@ -310,63 +305,64 @@ class AccountBot:
         self.clicks += 1
 
         if DRY_RUN:
-            # клика нет -> глоу не появится; имитируем «срубку» паузой
             self.resume_at = now + DRY_WAIT
             self.state = SCAN
             return False
 
-        # старт ожидания глоу
+        # старт ожидания добычи
         self.t0 = now
         self.hard_deadline = now + HARD_CAP
         self.appear_deadline = min(now + APPEAR_BASE + d * WALK_SEC_PER_PX,
                                    now + APPEAR_MAX, self.hard_deadline)
-        self.base = self._glow(bgr)   # фон в момент клика (перс не дошёл)
-        self.peak = self.base
+        self.base = max(1, self._stone_px(bgr))  # камень виден, перс ещё идёт
+        self.drop_thr = self.base * ENGAGE_DROP_FRAC
+        self.recover_thr = self.base * RECOVER_FRAC
+        self.lowest = self.base
         self.last = self.base
-        self.gone = 0
-        self.state = WAIT_APPEAR
+        self.back = 0
+        self.state = WAIT_ENGAGE
         return False
 
-    def _tick_appear(self, now):
+    def _tick_engage(self, now):
         bgr = grab_region(self.region)
-        self.last = self._glow(bgr)
-        self.peak = max(self.peak, self.last)
-        if self.last >= self.base + NEON_RISE_PX:
-            self.gone = 0
-            self.state = WAIT_VANISH
+        self.last = self._stone_px(bgr)
+        self.lowest = min(self.lowest, self.last)
+        if self.last <= self.drop_thr:
+            self.back = 0
+            self.state = WAIT_RECOVER
             return
         if now >= self.appear_deadline:
-            # глоу не появился -> куст/декор/недоступно -> чёрный список
+            # перс не взялся -> ложный/строение/недоступно -> чёрный список
             self.blacklist.append((self.target['click'], now))
             print(f"[{self.tag} #{self.clicks}] no_highlight "
-                  f"(base={self.base} peak={self.peak}) -> чёрный список "
+                  f"(base={self.base} min={self.lowest}) -> чёрный список "
                   f"{self.target['click']}")
             self.state = SCAN
 
-    def _tick_vanish(self, now):
+    def _tick_recover(self, now):
         if now >= self.hard_deadline:
             print(f"[{self.tag} #{self.clicks}] timeout "
-                  f"(base={self.base} peak={self.peak} last={self.last})")
+                  f"(base={self.base} min={self.lowest} last={self.last})")
             self.resume_at = now + random.uniform(*POST_CHOP_PAUSE)
             self.state = SCAN
             return
         bgr = grab_region(self.region)
-        self.last = self._glow(bgr)
-        self.peak = max(self.peak, self.last)
-        if self.last <= self.base + NEON_FALL_PX:
-            self.gone += 1
-            if self.gone >= VANISH_CONFIRM:
+        self.last = self._stone_px(bgr)
+        self.lowest = min(self.lowest, self.last)
+        if self.last >= self.recover_thr:
+            self.back += 1
+            if self.back >= VANISH_CONFIRM:
                 took = now - self.t0
-                print(f"[{self.tag} #{self.clicks}] chopped за {took:.1f}s "
-                      f"(base={self.base} peak={self.peak} last={self.last})")
+                print(f"[{self.tag} #{self.clicks}] mined за {took:.1f}s "
+                      f"(base={self.base} min={self.lowest} last={self.last})")
                 self.resume_at = now + random.uniform(*POST_CHOP_PAUSE)
                 self.state = SCAN
         else:
-            self.gone = 0
+            self.back = 0
 
     def _do_pan(self, bgr_before, reason):
-        """Один шаг пан-обхода (блокирующий drag — короткий, делается в свой тик).
-        Возвращает True если этот аккаунт обошёл всю карту -> DONE."""
+        """Один шаг пан-обхода (короткий блокирующий drag в свой тик).
+        Возвращает True если аккаунт обошёл всю карту -> DONE."""
         self.empty_pans += 1
         if self.empty_pans > MAX_EMPTY_PANS:
             print(f"[{self.tag}] {MAX_EMPTY_PANS} панов без целей — стоп (карта обойдена).")
@@ -424,7 +420,7 @@ class AccountBot:
 def main():
     regions = build_regions()
     print("=" * 56)
-    print(" TREE BOT x4 (interleave, единый курсор)")
+    print(" STONE-COAL BOT x4 (interleave, единый курсор)")
     print(f"  DRY_RUN = {DRY_RUN}")
     print(f"  Монитор = [{MONITOR_INDEX}]  DPI = {win_input.set_dpi_aware()}")
     print(f"  Виртуальный стол = {win_input.virtual_screen()}")
@@ -451,7 +447,7 @@ def main():
         if all_done:
             print("Все аккаунты обошли карты — стоп.")
             break
-        time.sleep(0.01)   # лёгкий yield, не жжём CPU (троттл — внутри tick)
+        time.sleep(0.01)   # лёгкий yield (троттл — внутри tick)
 
     total = sum(b.clicks for b in bots)
     print(f"Готово. Кликов всего: {total} "
