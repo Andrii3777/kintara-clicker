@@ -1,0 +1,448 @@
+# -*- coding: utf-8 -*-
+"""
+tree-4x/bot.py
+==============
+Авто-кликер деревьев на 4 АККАУНТА одновременно. Экран = 4 окна игры,
+разложенные «плиткой» 2x2 в квадрантах выбранного монитора (каждый квадрант =
+свой логин/мир).
+
+ПОЧЕМУ ТАК (ключевой принцип):
+  Курсор в системе ОДИН (win_input = SendInput, абсолютные координаты
+  виртуального стола). 4 бота не могут двигать его одновременно. НО почти всё
+  время бот ЖДЁТ (перс идёт + рубит, до HARD_CAP сек). Пока акк-0 ждёт глоу,
+  курсор свободен -> кликаем акк-1, акк-2, акк-3. Получаем ~4x за счёт
+  ИНТЕРЛИВИНГА пауз, а не за счёт второго курсора.
+
+Как реализовано:
+  - Каждый аккаунт = конечный автомат (FSM): SCAN -> WAIT_APPEAR -> WAIT_VANISH
+    -> (chopped) -> SCAN, либо -> PAN если целей нет.
+  - Планировщик (scheduler) по кругу даёт каждому аккаунту ОДИН «тик»: максимум
+    один захват региона + максимум одно действие мышью (клик ИЛИ один шаг пана).
+    Блокирующего ожидания нет -> аккаунты не держат друг друга.
+  - Все дедлайны по time.time() (не по итерациям) -> интерливинг их не ломает.
+
+Регионы: авто-2x2 квадранты MONITOR_INDEX (см. build_regions).
+
+Детекция/глоу — те же tree_detector.detect_trees / highlight_count, что и в
+одиночном bot.py. Картинка просто меньше (квадрант) -> возможно подкрутить
+пороги площади (см. MIN_CLICK_*).
+
+Стоп: 'q'. DRY_RUN=True — без кликов (FSM крутится на фикс-паузах).
+
+Зависимости (НЕ дублируем): tree_detector из ../tree, win_input из ../common.
+Запуск (из папки tree-4x):  python bot.py
+"""
+
+import time
+import math
+import random
+
+import cv2
+import numpy as np
+
+# DPI-aware ПЕРВЫМ делом — до mss/любого захвата.
+# Бутстрап путей: ../common (win_input, общий) и ../tree (tree_detector, ядро CV).
+# Детектор НЕ дублируем — единственный источник в tree/.
+import os, sys
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "..", "common"))
+sys.path.insert(0, os.path.join(_HERE, "..", "tree"))
+import win_input
+win_input.set_dpi_aware()
+
+import keyboard
+
+from tree_detector import detect_trees, highlight_count
+
+
+# ============================================================
+# CONFIG — крутим тут (значения = как в одиночном bot.py)
+# ============================================================
+
+DRY_RUN = False            # True = печать без клика (СНАЧАЛА проверь так!)
+MONITOR_INDEX = 1          # какой монитор делить на 2x2
+
+# --- Раскладка квадрантов ---
+# Авто 2x2 монитора. Поджимаем рамки внутрь на REGION_INSET долю, чтобы НЕ
+# ловить чужой квадрант / границу окна по краю.
+REGION_INSET = 0.0         # 0..0.2; >0 если по краям квадранта мусор
+
+# --- Ожидание срубки по ГЛОУ (относительно base) ---
+CHOP_POLL = 0.2            # целевой интервал между поллами ОДНОГО аккаунта, сек
+TREE_GLOW_R = 40
+NEON_RISE_PX = 180         # глоу >= base+это -> перс дошёл, рубит
+NEON_FALL_PX = 60          # глоу <= base+это -> срублено
+APPEAR_BASE = 3.0
+WALK_SEC_PER_PX = 0.020
+APPEAR_MAX = 6.0
+VANISH_CONFIRM = 2
+HARD_CAP = 8.0
+POST_CHOP_PAUSE = (0.1, 0.3)
+DRY_WAIT = 2.0             # в DRY_RUN держим «рубку» столько
+
+# --- Панорамирование (по диагоналям ромба, как в одиночном боте) ---
+PAN_DIST = 380
+PAN_DURATION = 0.6
+PAN_SETTLE = 0.6
+PAN_ROW_LEN = 12
+PAN_NUM_ROWS = 20
+MAX_EMPTY_PANS = 2 * PAN_NUM_ROWS * (PAN_ROW_LEN + 1) + 8
+PAN_ROW_START = 'SW'
+PAN_STEP_START = 'SE'
+
+# --- Отбор/выбор цели ---
+# ВНИМАНИЕ: квадрант = 1/4 экрана -> деревья мельче. Пороги площади, возможно,
+# надо уменьшить против одиночного bot.py. Откалибруй на debug-кадре квадранта.
+MIN_CLICK_TRUNK_AREA = 12
+MIN_CLICK_CROWN_AREA = 80
+CHAR_ANCHOR = (0.42, 0.40)   # доли ВНУТРИ квадранта (перс ~ центр окна)
+SAME_TREE_R = 18
+COOLDOWN_SEC = 12.0
+BLACKLIST_TTL = 45.0
+
+HOTKEY_STOP = 'q'
+
+DIR_VEC = {'NE': (1, -1), 'SW': (-1, 1), 'NW': (-1, -1), 'SE': (1, 1)}
+DIR_FLIP = {'NE': 'SW', 'SW': 'NE', 'NW': 'SE', 'SE': 'NW'}
+
+
+# ============================================================
+# Утилиты
+# ============================================================
+
+def dist(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def frame_change(a, b):
+    diff = cv2.absdiff(a, b)
+    return float(np.count_nonzero(diff.sum(2) > 30)) / (a.shape[0] * a.shape[1])
+
+
+def build_regions():
+    """
+    Разбить MONITOR_INDEX на 4 квадранта 2x2. Каждый регион — dict в АБСОЛЮТНЫХ
+    координатах виртуального стола (left/top уже со смещением монитора), как ждёт
+    mss.grab и win_input. Порядок: [TL, TR, BL, BR].
+    """
+    import mss
+    with mss.mss() as sct:
+        mon = sct.monitors[MONITOR_INDEX]
+    L, T, W, H = mon['left'], mon['top'], mon['width'], mon['height']
+    hw, hh = W // 2, H // 2
+    ins_x, ins_y = int(hw * REGION_INSET), int(hh * REGION_INSET)
+    cells = [(L, T), (L + hw, T), (L, T + hh), (L + hw, T + hh)]
+    names = ['TL', 'TR', 'BL', 'BR']
+    regions = []
+    for (cl, ct), nm in zip(cells, names):
+        regions.append({'name': nm,
+                        'left': cl + ins_x, 'top': ct + ins_y,
+                        'width': hw - 2 * ins_x, 'height': hh - 2 * ins_y})
+    return regions
+
+
+def grab_region(region):
+    """Захват одного региона -> BGR. Координаты региона уже абсолютные."""
+    import mss
+    with mss.mss() as sct:
+        shot = np.array(sct.grab({'left': region['left'], 'top': region['top'],
+                                  'width': region['width'],
+                                  'height': region['height']}))
+    return cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
+
+
+def pick_confident(trees):
+    return [t for t in trees
+            if t['trunk_area'] >= MIN_CLICK_TRUNK_AREA
+            and t['crown_area'] >= MIN_CLICK_CROWN_AREA]
+
+
+def choose_target(trees, last_pos, anchor_px, recent, blacklist):
+    """Та же логика выбора, что в одиночном боте (см. bot.py.choose_target)."""
+    ref = last_pos if last_pos is not None else anchor_px
+
+    def near(p, pts):
+        return any(dist(p, r) < SAME_TREE_R for r in pts)
+
+    usable = [t for t in trees if not near(t['click'], blacklist)]
+    cand = [t for t in usable if not near(t['click'], recent)]
+    if not cand:
+        cand = usable
+    if not cand:
+        return None
+    return min(cand, key=lambda t: dist(t['click'], ref))
+
+
+# ============================================================
+# Аккаунт = конечный автомат (без блокирующих ожиданий)
+# ============================================================
+
+# Состояния FSM
+SCAN = 'SCAN'
+WAIT_APPEAR = 'WAIT_APPEAR'
+WAIT_VANISH = 'WAIT_VANISH'
+DONE = 'DONE'
+
+
+class AccountBot:
+    """
+    Один аккаунт в своём квадранте. tick() двигает автомат НА ОДИН шаг и делает
+    максимум одно действие мышью. Возвращает True если этот аккаунт закончил
+    (обошёл всю карту и целей нет).
+    """
+
+    def __init__(self, idx, region):
+        self.idx = idx
+        self.region = region
+        self.tag = f"A{idx}:{region['name']}"
+        self.state = SCAN
+
+        # выбор цели
+        self.last_pos = None
+        self.recent = []        # [(pos, t)]
+        self.blacklist = []     # [(pos, t)]
+        self.clicks = 0
+
+        # текущая цель / тайминги ожидания
+        self.target = None
+        self.t0 = 0.0
+        self.appear_deadline = 0.0
+        self.hard_deadline = 0.0
+        self.base = 0
+        self.peak = 0
+        self.last = 0
+        self.gone = 0
+        self.resume_at = 0.0     # не сканировать раньше (пауза после срубки)
+        self.last_poll = 0.0     # время последнего полла (троттл CHOP_POLL)
+
+        # пан-обход (счётчики, как в одиночном do_pan)
+        self.empty_pans = 0
+        self.row_dir = PAN_ROW_START
+        self.step_dir = PAN_STEP_START
+        self.row_pans = 0
+        self.step_count = 0
+        self.pending_step = False
+
+    # -- помощники --
+    def _abs(self, local_xy):
+        """Локальная точка региона -> абс. координаты виртуального стола."""
+        return (self.region['left'] + local_xy[0],
+                self.region['top'] + local_xy[1])
+
+    def _glow(self, bgr):
+        cx, cy = self.target['click']
+        return highlight_count(bgr, cx, cy, TREE_GLOW_R)
+
+    def _expire_memory(self, now):
+        self.recent = [(p, t) for (p, t) in self.recent if now - t < COOLDOWN_SEC]
+        self.blacklist = [(p, t) for (p, t) in self.blacklist
+                          if now - t < BLACKLIST_TTL]
+
+    # -- главный тик --
+    def tick(self):
+        now = time.time()
+        if self.state == DONE:
+            return True
+
+        # троттл: один аккаунт не чаще CHOP_POLL (но другие тикают свободно)
+        if now - self.last_poll < CHOP_POLL:
+            return False
+        self.last_poll = now
+
+        if self.state == SCAN:
+            return self._tick_scan(now)
+        if self.state == WAIT_APPEAR:
+            self._tick_appear(now)
+            return False
+        if self.state == WAIT_VANISH:
+            self._tick_vanish(now)
+            return False
+        return False
+
+    def _tick_scan(self, now):
+        if now < self.resume_at:
+            return False
+        self._expire_memory(now)
+        bgr = grab_region(self.region)
+        H, W = bgr.shape[:2]
+        anchor = (int(CHAR_ANCHOR[0] * W), int(CHAR_ANCHOR[1] * H))
+
+        trees, _, _, _ = detect_trees(bgr)
+        trees = pick_confident(trees)
+
+        recent_pts = [p for (p, _) in self.recent]
+        black_pts = [p for (p, _) in self.blacklist]
+        target = choose_target(trees, self.last_pos, anchor,
+                               recent_pts, black_pts) if trees else None
+
+        if target is None:
+            reason = "нет деревьев" if not trees else "все в чёрном списке"
+            return self._do_pan(bgr, reason)
+
+        self.empty_pans = 0
+        self.target = target
+        d = 0.0 if self.last_pos is None else dist(self.last_pos, target['click'])
+
+        ax, ay = self._abs(target['click'])
+        print(f"[{self.tag} #{self.clicks}] дерево@{target['click']} "
+              f"trunk={target['trunk_area']} crown={target['crown_area']} "
+              f"dist={d:.0f} -> click({ax},{ay})")
+
+        if not DRY_RUN:
+            win_input.click_abs(ax, ay)
+
+        self.last_pos = target['click']
+        self.recent.append((target['click'], now))
+        self.clicks += 1
+
+        if DRY_RUN:
+            # клика нет -> глоу не появится; имитируем «срубку» паузой
+            self.resume_at = now + DRY_WAIT
+            self.state = SCAN
+            return False
+
+        # старт ожидания глоу
+        self.t0 = now
+        self.hard_deadline = now + HARD_CAP
+        self.appear_deadline = min(now + APPEAR_BASE + d * WALK_SEC_PER_PX,
+                                   now + APPEAR_MAX, self.hard_deadline)
+        self.base = self._glow(bgr)   # фон в момент клика (перс не дошёл)
+        self.peak = self.base
+        self.last = self.base
+        self.gone = 0
+        self.state = WAIT_APPEAR
+        return False
+
+    def _tick_appear(self, now):
+        bgr = grab_region(self.region)
+        self.last = self._glow(bgr)
+        self.peak = max(self.peak, self.last)
+        if self.last >= self.base + NEON_RISE_PX:
+            self.gone = 0
+            self.state = WAIT_VANISH
+            return
+        if now >= self.appear_deadline:
+            # глоу не появился -> куст/декор/недоступно -> чёрный список
+            self.blacklist.append((self.target['click'], now))
+            print(f"[{self.tag} #{self.clicks}] no_highlight "
+                  f"(base={self.base} peak={self.peak}) -> чёрный список "
+                  f"{self.target['click']}")
+            self.state = SCAN
+
+    def _tick_vanish(self, now):
+        if now >= self.hard_deadline:
+            print(f"[{self.tag} #{self.clicks}] timeout "
+                  f"(base={self.base} peak={self.peak} last={self.last})")
+            self.resume_at = now + random.uniform(*POST_CHOP_PAUSE)
+            self.state = SCAN
+            return
+        bgr = grab_region(self.region)
+        self.last = self._glow(bgr)
+        self.peak = max(self.peak, self.last)
+        if self.last <= self.base + NEON_FALL_PX:
+            self.gone += 1
+            if self.gone >= VANISH_CONFIRM:
+                took = now - self.t0
+                print(f"[{self.tag} #{self.clicks}] chopped за {took:.1f}s "
+                      f"(base={self.base} peak={self.peak} last={self.last})")
+                self.resume_at = now + random.uniform(*POST_CHOP_PAUSE)
+                self.state = SCAN
+        else:
+            self.gone = 0
+
+    def _do_pan(self, bgr_before, reason):
+        """Один шаг пан-обхода (блокирующий drag — короткий, делается в свой тик).
+        Возвращает True если этот аккаунт обошёл всю карту -> DONE."""
+        self.empty_pans += 1
+        if self.empty_pans > MAX_EMPTY_PANS:
+            print(f"[{self.tag}] {MAX_EMPTY_PANS} панов без целей — стоп (карта обойдена).")
+            self.state = DONE
+            return True
+
+        if self.pending_step:
+            direction = self.step_dir
+            changed = self._pan(bgr_before, direction)
+            self.step_count += 1
+            print(f"[{self.tag}] {reason} -> шаг '{direction}' "
+                  f"измен={changed*100:.0f}% ряд {self.step_count}/{PAN_NUM_ROWS} "
+                  f"({self.empty_pans}/{MAX_EMPTY_PANS})")
+            if self.step_count >= PAN_NUM_ROWS:
+                self.step_count = 0
+                self.step_dir = DIR_FLIP[self.step_dir]
+            self.pending_step = False
+        else:
+            direction = self.row_dir
+            changed = self._pan(bgr_before, direction)
+            self.row_pans += 1
+            print(f"[{self.tag}] {reason} -> пан '{direction}' "
+                  f"измен={changed*100:.0f}% ряд {self.row_pans}/{PAN_ROW_LEN} "
+                  f"({self.empty_pans}/{MAX_EMPTY_PANS})")
+            if self.row_pans >= PAN_ROW_LEN:
+                self.row_pans = 0
+                self.pending_step = True
+                self.row_dir = DIR_FLIP[self.row_dir]
+
+        self.last_pos = None       # карта сдвинулась
+        self.recent = []
+        self.state = SCAN
+        return False
+
+    def _pan(self, bgr_before, direction):
+        """Drag из ЦЕНТРА своего квадранта по диагонали. Не выходит за регион."""
+        if DRY_RUN:
+            time.sleep(0.1)
+            return 1.0
+        r = self.region
+        sx = r['left'] + r['width'] // 2
+        sy = r['top'] + r['height'] // 2
+        vx, vy = DIR_VEC[direction]
+        win_input.drag_abs(sx, sy, sx + vx * PAN_DIST, sy + vy * PAN_DIST,
+                           steps=25, duration=PAN_DURATION)
+        time.sleep(PAN_SETTLE)
+        after = grab_region(r)
+        return frame_change(bgr_before, after)
+
+
+# ============================================================
+# Планировщик: по кругу тикает 4 аккаунта, владеет единым курсором
+# ============================================================
+
+def main():
+    regions = build_regions()
+    print("=" * 56)
+    print(" TREE BOT x4 (interleave, единый курсор)")
+    print(f"  DRY_RUN = {DRY_RUN}")
+    print(f"  Монитор = [{MONITOR_INDEX}]  DPI = {win_input.set_dpi_aware()}")
+    print(f"  Виртуальный стол = {win_input.virtual_screen()}")
+    for r in regions:
+        print(f"    {r['name']}: left={r['left']} top={r['top']} "
+              f"{r['width']}x{r['height']}")
+    print(f"  Стоп: '{HOTKEY_STOP}'")
+    print("=" * 56)
+    print("Старт через 3 сек — разложи 4 окна по квадрантам...")
+    time.sleep(3)
+
+    bots = [AccountBot(i, r) for i, r in enumerate(regions)]
+
+    while True:
+        if keyboard.is_pressed(HOTKEY_STOP):
+            print("Стоп по клавише.")
+            break
+        all_done = True
+        for b in bots:
+            if keyboard.is_pressed(HOTKEY_STOP):
+                break
+            done = b.tick()
+            all_done = all_done and done
+        if all_done:
+            print("Все аккаунты обошли карты — стоп.")
+            break
+        time.sleep(0.01)   # лёгкий yield, не жжём CPU (троттл — внутри tick)
+
+    total = sum(b.clicks for b in bots)
+    print(f"Готово. Кликов всего: {total} "
+          f"({', '.join(f'{b.tag}={b.clicks}' for b in bots)})")
+
+
+if __name__ == "__main__":
+    main()
