@@ -64,9 +64,11 @@ def virtual_screen():
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_WHEEL = 0x0800
 MOUSEEVENTF_ABSOLUTE = 0x8000
 MOUSEEVENTF_VIRTUALDESK = 0x4000
 INPUT_MOUSE = 0
+WHEEL_DELTA = 120          # один «щелчок» колеса
 
 
 class _MOUSEINPUT(ctypes.Structure):
@@ -83,9 +85,9 @@ class _INPUT(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("u", _U)]
 
 
-def _send(flags, nx=0, ny=0):
+def _send(flags, nx=0, ny=0, data=0):
     inp = _INPUT(type=INPUT_MOUSE,
-                 mi=_MOUSEINPUT(dx=nx, dy=ny, mouseData=0,
+                 mi=_MOUSEINPUT(dx=nx, dy=ny, mouseData=data,
                                 dwFlags=flags, time=0, dwExtraInfo=None))
     ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
@@ -111,6 +113,17 @@ def click_abs(x, y):
     base = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
     _send(MOUSEEVENTF_LEFTDOWN | base, nx, ny)
     _send(MOUSEEVENTF_LEFTUP | base, nx, ny)
+
+
+def scroll(amount, x=None, y=None):
+    """
+    Прокрутка колеса мыши. amount в «щелчках»: >0 вверх, <0 вниз
+    (как pyautogui.scroll). Если заданы x,y — сперва переместить курсор туда
+    (физ. пиксели виртуального стола), колесо шлёт событие в точку под курсором.
+    """
+    if x is not None and y is not None:
+        move_abs(x, y)
+    _send(MOUSEEVENTF_WHEEL, data=int(amount) * WHEEL_DELTA)
 
 
 def drag_abs(x1, y1, x2, y2, steps=25, duration=0.6):

@@ -53,6 +53,7 @@ win_input.set_dpi_aware()
 import keyboard
 
 from stone_detector import detect_stones, stone_px
+from reconnect import load_templates, emergency_ui_check
 
 
 # ============================================================
@@ -71,6 +72,23 @@ QUADRANT_TL = True
 QUADRANT_TR = True
 QUADRANT_BL = True
 QUADRANT_BR = True
+
+# --- Перезаход на сервер (UI-шаблоны matchTemplate) ---
+# Каждый квадрант (аккаунт) заходит на СВОЙ сервер. Шаблоны в common/ui/.
+# Высший приоритет: видим попап дисконнекта/очереди/меню -> бросаем фарм,
+# обрабатываем (клик OK/RETRY/SERVER N или скролл списка), потом фарм дальше.
+UI_DIR = os.path.join(_HERE, "..", "common", "ui")
+QUADRANT_TL_SERVER = "server_2"   # лево-верх
+QUADRANT_TR_SERVER = "server_3"   # право-верх
+QUADRANT_BL_SERVER = "server_4"   # лево-низ
+QUADRANT_BR_SERVER = "server_2"   # право-низ (поправь под нужный сервер)
+UI_CHECK_INTERVAL = 1.0    # как часто сканить UI когда спокойно, сек
+UI_CLICK_DELAY = 2.5       # пауза после клика по UI, сек
+UI_WAIT_DELAY = 4.0        # пауза если «в очереди», сек
+UI_SCROLL_DELAY = 1.8      # пауза после шага скролла списка, сек
+UI_SCROLL_FOCUS_DY = 15    # клик на столько px ВЫШЕ заголовка (фокус окна)
+UI_SCROLL_INTO_DY = 150    # курсор на столько px НИЖЕ заголовка (в зону списка)
+UI_SCROLL_NOTCHES = -1     # шаг колеса: <0 вниз (1 щелчок)
 
 # --- Ожидание добычи по ПИКСЕЛЯМ КАМНЯ (инвертированный сигнал, без глоу) ---
 CHOP_POLL = 0.2            # целевой интервал между поллами ОДНОГО аккаунта, сек
@@ -139,6 +157,8 @@ def build_regions():
              'BL': (L, T + hh), 'BR': (L + hw, T + hh)}
     enabled = {'TL': QUADRANT_TL, 'TR': QUADRANT_TR,
                'BL': QUADRANT_BL, 'BR': QUADRANT_BR}
+    servers = {'TL': QUADRANT_TL_SERVER, 'TR': QUADRANT_TR_SERVER,
+               'BL': QUADRANT_BL_SERVER, 'BR': QUADRANT_BR_SERVER}
     regions = []
     for nm in ('TL', 'TR', 'BL', 'BR'):   # стабильный порядок
         if not enabled[nm]:
@@ -146,7 +166,8 @@ def build_regions():
         cl, ct = cells[nm]
         regions.append({'name': nm,
                         'left': cl + ins_x, 'top': ct + ins_y,
-                        'width': hw - 2 * ins_x, 'height': hh - 2 * ins_y})
+                        'width': hw - 2 * ins_x, 'height': hh - 2 * ins_y,
+                        'target_server': servers[nm]})
     if not regions:
         raise SystemExit("Все квадранты выключены — включи хотя бы один QUADRANT_*.")
     return regions
@@ -200,11 +221,16 @@ class AccountBot:
     (обошёл всю карту и целей нет).
     """
 
-    def __init__(self, idx, region):
+    def __init__(self, idx, region, templates):
         self.idx = idx
         self.region = region
         self.tag = f"A{idx}:{region['name']}"
         self.state = SCAN
+
+        # перезаход на сервер
+        self.templates = templates
+        self.target_server = region['target_server']
+        self.next_ui = 0.0      # троттл UI-проверки
 
         # выбор цели
         self.last_pos = None
@@ -248,11 +274,58 @@ class AccountBot:
         self.blacklist = [(p, t) for (p, t) in self.blacklist
                           if now - t < BLACKLIST_TTL]
 
+    def _reset_farm(self):
+        """Сброс фарм-состояния (после перезахода карта/координаты другие)."""
+        self.state = SCAN
+        self.target = None
+        self.last_pos = None
+        self.recent = []
+        self.resume_at = 0.0
+
+    def _tick_ui(self, now):
+        """
+        UI/перезаход — высший приоритет. Вернуть True если было UI-действие
+        (фарм в этот тик пропускаем). False -> UI нет, фармим дальше.
+        """
+        bgr = grab_region(self.region)
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        action = emergency_ui_check(gray, self.target_server, self.templates)
+        if action is None:
+            self.next_ui = now + UI_CHECK_INTERVAL
+            return False
+
+        print(f"[{self.tag}] {action['msg']}")
+        self._reset_farm()
+        act = action['action']
+
+        if act == 'wait':
+            self.next_ui = now + UI_WAIT_DELAY
+            return True
+
+        ax, ay = self._abs((action['x'], action['y']))
+        if act == 'click':
+            if not DRY_RUN:
+                win_input.click_abs(ax, ay)
+            self.next_ui = now + UI_CLICK_DELAY
+        elif act == 'scroll':
+            # клик чуть ВЫШЕ заголовка (фокус) -> курсор в зону списка -> колесо
+            if not DRY_RUN:
+                win_input.click_abs(ax, ay - UI_SCROLL_FOCUS_DY)
+                time.sleep(0.1)
+                win_input.scroll(UI_SCROLL_NOTCHES, ax, ay + UI_SCROLL_INTO_DY)
+            self.next_ui = now + UI_SCROLL_DELAY
+        return True
+
     # -- главный тик --
     def tick(self):
         now = time.time()
         if self.state == DONE:
             return True
+
+        # перезаход на сервер — высший приоритет, свой троттл next_ui
+        if now >= self.next_ui:
+            if self._tick_ui(now):
+                return False
 
         # троттл: один аккаунт не чаще CHOP_POLL (другие тикают свободно)
         if now - self.last_poll < CHOP_POLL:
@@ -426,13 +499,18 @@ def main():
     print(f"  Виртуальный стол = {win_input.virtual_screen()}")
     for r in regions:
         print(f"    {r['name']}: left={r['left']} top={r['top']} "
-              f"{r['width']}x{r['height']}")
+              f"{r['width']}x{r['height']}  сервер={r['target_server']}")
+    templates = load_templates(UI_DIR)
+    missing = [n for n, t in templates.items() if t is None]
+    print(f"  UI-шаблоны: {UI_DIR}")
+    if missing:
+        print(f"  ВНИМАНИЕ: нет шаблонов {missing} — перезаход для них не сработает.")
     print(f"  Стоп: '{HOTKEY_STOP}'")
     print("=" * 56)
     print("Старт через 3 сек — разложи 4 окна по квадрантам...")
     time.sleep(3)
 
-    bots = [AccountBot(i, r) for i, r in enumerate(regions)]
+    bots = [AccountBot(i, r, templates) for i, r in enumerate(regions)]
 
     while True:
         if keyboard.is_pressed(HOTKEY_STOP):
