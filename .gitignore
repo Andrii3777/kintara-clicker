@@ -12,3 +12,4 @@ dbg_*.png
 
 # Secrets
 golda-bot/config.py
+golda-bot/.env
