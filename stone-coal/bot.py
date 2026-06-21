@@ -42,7 +42,7 @@ import keyboard
 
 from stone_detector import detect_stones, stone_px
 from reconnect import load_templates, emergency_ui_check
-from pan import Panner
+from pan import Panner, zoom_map
 
 
 # ============================================================
@@ -91,6 +91,11 @@ PAN_ROW_LEN = 12          # панов вдоль ряда (ось SW<->NE)
 PAN_NUM_ROWS = 20         # шагов вдоль оси SE<->NW (несёт в право-низ), с запасом
 PAN_ROW_START = 'SW'      # ось ряда: 'SW'(↙) <-> 'NE'(↗)
 PAN_STEP_START = 'SE'     # ось шага: 'SE'(↘) <-> 'NW'(↖)
+
+# --- Zoom карты после входа на сервер (общий, common/pan.py) ---
+ZOOM_ON_ENTER = True      # после захода на сервер уменьшить карту колесом
+ZOOM_NOTCHES = -1         # <0 вниз (обычно zoom out; наоборот -> поставь >0)
+ZOOM_TIMES = 6            # сколько полных прокрутов
 
 # --- Отбор камней (уверенность) ---
 # Детектор уже фильтрует площадь/форму/окружение. Тут — доп. порог "уверенного"
@@ -263,13 +268,14 @@ def check_reconnect(bgr, mon, templates, state):
             win_input.click_abs(ax, ay)
         return UI_CLICK_DELAY
     if act == 'scroll':
-        # Фокус окна на БЕЗОПАСНОЙ точке (заголовок, не карточка!) -> колесо над
-        # списком. reconnect отдаёт focus_x/focus_y (заголовок) и x/y (зона колеса).
+        # Фокус-клик ТОЛЬКО если reconnect дал безопасную точку (заголовок).
+        # Нет focus_x -> заголовок не распознан -> НЕ кликаем (иначе попадём по
+        # карточке платного сервера KINTARA CLUB), крутим только колесом.
         if not DRY_RUN:
-            fx = action.get('focus_x', action['x']) + mon['left']
-            fy = action.get('focus_y', action['y'] - UI_SCROLL_FOCUS_DY) + mon['top']
-            win_input.click_abs(fx, fy)
-            time.sleep(0.1)
+            if 'focus_x' in action:
+                win_input.click_abs(action['focus_x'] + mon['left'],
+                                    action['focus_y'] + mon['top'])
+                time.sleep(0.1)
             win_input.scroll(UI_SCROLL_NOTCHES, ax, ay)
         return UI_SCROLL_DELAY
     return None
@@ -307,6 +313,7 @@ def main():
                'PAN_NUM_ROWS': PAN_NUM_ROWS, 'ROW_START': PAN_ROW_START,
                'STEP_START': PAN_STEP_START, 'DRY_WAIT': NO_TARGET_WAIT}
     panner = None
+    was_in_ui = True   # True на старте -> при первом входе в мир тоже зумим
 
     while True:
         if keyboard.is_pressed(HOTKEY_STOP):
@@ -329,6 +336,7 @@ def main():
                 block_until = now + delay   # пока UI активен — НЕ фармить
                 last_pos = None      # после перезахода координаты другие
                 recent = []
+                was_in_ui = True     # были в UI -> при выходе в мир зумнём
                 if panner:
                     panner.reset()   # карта/координаты другие
                 continue
@@ -338,6 +346,17 @@ def main():
         if now < block_until:
             time.sleep(0.05)
             continue
+
+        # вошли в мир после UI/перезахода -> уменьшить карту (один раз)
+        if was_in_ui:
+            was_in_ui = False
+            if ZOOM_ON_ENTER:
+                zoom_map(mon, ZOOM_NOTCHES, ZOOM_TIMES, dry_run=DRY_RUN)
+                last_pos = None
+                recent = []
+                if panner:
+                    panner.reset()
+                continue
 
         H, W = bgr.shape[:2]
         anchor_px = (int(CHAR_ANCHOR[0] * W), int(CHAR_ANCHOR[1] * H))

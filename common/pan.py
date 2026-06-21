@@ -46,6 +46,22 @@ def frame_change(a, b):
     return float(np.count_nonzero(diff.sum(2) > 30)) / (a.shape[0] * a.shape[1])
 
 
+def zoom_map(region, notches=-1, times=3, dry_run=False, log=print):
+    """
+    Уменьшить карту колесом мыши после входа на сервер: `times` полных прокрутов
+    в ЦЕНТРЕ региона. `notches`<0 — вниз (обычно zoom out; если у тебя наоборот —
+    поставь >0). ОБЩЕЕ для всех ботов.
+    """
+    log(f"  [zoom] уменьшаю карту: {times} прокрута (notches={notches})")
+    if dry_run:
+        return
+    cx = region['left'] + region['width'] // 2
+    cy = region['top'] + region['height'] // 2
+    for _ in range(times):
+        win_input.scroll(notches, cx, cy)
+        time.sleep(0.15)
+
+
 class Panner:
     """
     Обход карты змейкой. Один вызов step() = ОДИН пан (drag). Возвращает True

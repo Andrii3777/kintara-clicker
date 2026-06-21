@@ -54,7 +54,7 @@ import keyboard
 
 from tree_detector import detect_trees, highlight_count
 from reconnect import load_templates, emergency_ui_check
-from pan import Panner
+from pan import Panner, zoom_map
 
 
 # ============================================================
@@ -117,6 +117,11 @@ PAN_NUM_ROWS = 20
 PAN_ROW_START = 'SW'
 PAN_STEP_START = 'SE'
 PAN_DRY_WAIT = 0.1         # пауза вместо drag в DRY_RUN
+
+# --- Zoom карты после входа на сервер (общий, common/pan.py) ---
+ZOOM_ON_ENTER = True       # после захода уменьшить карту колесом
+ZOOM_NOTCHES = -1          # <0 вниз (обычно zoom out; наоборот -> >0)
+ZOOM_TIMES = 6             # сколько полных прокрутов
 
 # --- Отбор/выбор цели ---
 # ВНИМАНИЕ: квадрант = 1/4 экрана -> деревья мельче. Пороги площади, возможно,
@@ -261,6 +266,7 @@ class AccountBot:
         # пан-обход — общий Panner (drag из центра СВОЕГО квадранта)
         self.panner = Panner(region, PAN_CFG, dry_run=DRY_RUN, tag=self.tag,
                              grab=lambda: grab_region(self.region))
+        self.was_in_ui = True   # True на старте -> при первом входе в мир зумим
 
     # -- помощники --
     def _abs(self, local_xy):
@@ -297,10 +303,19 @@ class AccountBot:
                                     self.ui_state)
         if action is None:
             self.next_ui = now + UI_CHECK_INTERVAL
+            # вошли в мир после UI/перезахода -> уменьшить карту (один раз)
+            if self.was_in_ui:
+                self.was_in_ui = False
+                if ZOOM_ON_ENTER:
+                    zoom_map(self.region, ZOOM_NOTCHES, ZOOM_TIMES,
+                             dry_run=DRY_RUN, log=lambda m: print(f"[{self.tag}]{m}"))
+                    self._reset_farm()
+                    return True   # тик потрачен на zoom
             return False
 
         print(f"[{self.tag}] {action['msg']}")
         self._reset_farm()      # НЕ трогает ui_state (память скролла ведёт reconnect)
+        self.was_in_ui = True   # были в UI -> при выходе в мир зумнём
         act = action['action']
 
         if act == 'wait':
@@ -313,14 +328,14 @@ class AccountBot:
                 win_input.click_abs(ax, ay)
             self.next_ui = now + UI_CLICK_DELAY
         elif act == 'scroll':
-            # Фокус на БЕЗОПАСНОЙ точке (заголовок, не карточка!) -> колесо над
-            # списком. focus_x/focus_y = заголовок, x/y = зона колеса.
+            # Фокус-клик ТОЛЬКО если reconnect дал безопасную точку (заголовок).
+            # Нет focus_x -> заголовок не распознан -> НЕ кликаем (иначе попадём
+            # по карточке платного KINTARA CLUB), крутим только колесом.
             if not DRY_RUN:
-                fx, fy = self._abs((action.get('focus_x', action['x']),
-                                    action.get('focus_y',
-                                               action['y'] - UI_SCROLL_FOCUS_DY)))
-                win_input.click_abs(fx, fy)
-                time.sleep(0.1)
+                if 'focus_x' in action:
+                    fx, fy = self._abs((action['focus_x'], action['focus_y']))
+                    win_input.click_abs(fx, fy)
+                    time.sleep(0.1)
                 win_input.scroll(UI_SCROLL_NOTCHES, ax, ay)
             self.next_ui = now + UI_SCROLL_DELAY
         return True

@@ -42,6 +42,16 @@ import cv2
 MIN_CONF = 0.50          # минимальная уверенность OCR
 MAX_SCROLLS = 15         # потолок скроллов списка (страховка от джиттера OCR)
 
+# Зоны-мусор (доли кадра), где OCR ловит НЕ попапы: верх браузера (вкладки/адрес/
+# закладки — "kintara.gg/play"), чат снизу-слева ("donate now"), таскбар. Попапы
+# перезахода/очереди/сервера ВСЕГДА по центру -> эти зоны игнорируем.
+# (x0, y0, x1, y1) в долях. Подгони под свой браузер если хром выше/ниже.
+IGNORE_ZONES = [
+    (0.00, 0.00, 1.00, 0.14),   # верх: вкладки + адресная строка + закладки
+    (0.00, 0.60, 0.36, 1.00),   # низ-лево: окно чата
+    (0.00, 0.95, 1.00, 1.00),   # низ: таскбар Windows
+]
+
 # "FULL · 20 IN QUEUE" / "FULL·15INQUEUE" / "FULL-12IN QUEUE" -> число очереди
 QUEUE_RE = re.compile(r"(\d+)\s*IN\s*QUEUE")
 
@@ -114,6 +124,21 @@ def _find_multi(items, keywords, min_conf=MIN_CONF):
     if all(k in centers for k in keywords):
         return centers[keywords[0]]
     return None
+
+
+def _in_ignore(center, W, H):
+    """Точка в зоне-мусоре (браузер/чат/таскбар)? -> True (игнорировать)."""
+    fx, fy = center[0] / W, center[1] / H
+    return any(x0 <= fx <= x1 and y0 <= fy <= y1
+               for x0, y0, x1, y1 in IGNORE_ZONES)
+
+
+def _find_lowest(items, *keywords, min_conf=MIN_CONF):
+    """Из боксов с ЛЮБЫМ keyword вернуть САМЫЙ НИЖНИЙ (max y) center, иначе None.
+    Для попапов где фраза есть и в тексте, и на кнопке — кнопка внизу."""
+    hit = [center for text, center, conf in items
+           if conf >= min_conf and any(k in text for k in keywords)]
+    return max(hit, key=lambda c: c[1]) if hit else None
 
 
 # --- Парс списка серверов ---------------------------------------------------
@@ -202,6 +227,11 @@ def emergency_ui_check(frame, target_server=None, templates=None, state=None):
     items = _run_ocr(engine, frame)
     if not items:
         return None
+    # выкинуть текст из зон-мусора (браузер/чат/таскбар) — попапы только по центру
+    H, W = frame.shape[:2]
+    items = [it for it in items if not _in_ignore(it[1], W, H)]
+    if not items:
+        return None
     joined = " ".join(t for t, _, c in items if c >= MIN_CONF)
 
     # 1) Ошибка коннекта -> RETRY (ВЫШЕ очереди: текст ошибки содержит "queue").
@@ -234,6 +264,15 @@ def emergency_ui_check(frame, target_server=None, templates=None, state=None):
             return {"action": "click", "x": center[0], "y": center[1],
                     "msg": "Вылет — жму OK."}
 
+    # 4b) Попап торговца «Safe travels.» — клик кнопки (фраза есть и в теле
+    #     текста, и на кнопке -> берём САМУЮ НИЖНЮЮ = кнопку).
+    pos = _find_lowest(items, "TRAVELS")
+    if pos:
+        if isinstance(state, dict):
+            state.clear()
+        return {"action": "click", "x": pos[0], "y": pos[1],
+                "msg": "Торговец ушёл — жму Safe travels."}
+
     # 5) Главное меню -> Play Now (оба слова, иначе ловит "PLAYER1").
     pos = _find_multi(items, ("PLAY", "NOW"))
     if pos:
@@ -242,8 +281,11 @@ def emergency_ui_check(frame, target_server=None, templates=None, state=None):
         return {"action": "click", "x": pos[0], "y": pos[1],
                 "msg": "Главное меню — жму Play Now."}
 
-    # 6) Экран выбора сервера (заголовок ИЛИ распознаны строки серверов).
-    if (_find_multi(items, ("SELECT", "SERVER")) or "REALM" in joined
+    # 6) Экран выбора сервера. Заголовок строго ДВУМЯ словами вместе
+    #    ("SELECT A SERVER"/"CHOOSE YOUR REALM") ИЛИ распознаны строки серверов.
+    #    НЕ голый "SERVER"/"REALM": в игре есть "Server 13" и чат-кнопка "Realm".
+    if (_find_multi(items, ("SELECT", "SERVER"))
+            or _find_multi(items, ("CHOOSE", "REALM"))
             or _parse_servers(items)):
         return _server_select(items, state)
 
