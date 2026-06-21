@@ -42,6 +42,7 @@ import keyboard
 
 from stone_detector import detect_stones, stone_px
 from reconnect import load_templates, emergency_ui_check
+from pan import Panner
 
 
 # ============================================================
@@ -77,6 +78,9 @@ DRY_WAIT = 2.0            # в DRY_RUN добычу не видно -> фикс 
 NO_TARGET_WAIT = 1.0      # пауза после пана до пересканирования, сек
 
 # --- Панорамирование карты (камера статична, карта = РОМБ/изометрия!) ---
+# Логика обхода — общая в common/pan.py (Panner). Тут только включатель + параметры.
+PAN_ENABLED = False       # ВЫКЛ по умолчанию: целей нет -> ждать на месте, карту
+                          # НЕ двигать. True -> обход «газонокосилкой».
 # Оси карты на экране идут по ДИАГОНАЛЯМ (↗↙ и ↘↖). Панорамируем вдоль диагоналей:
 # ряд вдоль одной оси, шаг вдоль другой. Всё по счётчикам (детект края убран —
 # у края игра пружинит). Те же значения что у дерева (карта та же).
@@ -85,7 +89,6 @@ PAN_DURATION = 0.6        # время одного drag, сек
 PAN_SETTLE = 0.6          # пауза после drag чтоб карта устаканилась, сек
 PAN_ROW_LEN = 12          # панов вдоль ряда (ось SW<->NE)
 PAN_NUM_ROWS = 20         # шагов вдоль оси SE<->NW (несёт в право-низ), с запасом
-MAX_EMPTY_PANS = 2 * PAN_NUM_ROWS * (PAN_ROW_LEN + 1) + 8  # стоп: обошли всё
 PAN_ROW_START = 'SW'      # ось ряда: 'SW'(↙) <-> 'NE'(↗)
 PAN_STEP_START = 'SE'     # ось шага: 'SE'(↘) <-> 'NW'(↖)
 
@@ -137,33 +140,6 @@ def grab_screen():
 
 def dist(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
-
-
-def frame_change(a, b):
-    """Доля заметно изменившихся пикселей между кадрами a и b (0..1)."""
-    diff = cv2.absdiff(a, b)
-    return float(np.count_nonzero(diff.sum(2) > 30)) / (a.shape[0] * a.shape[1])
-
-
-# Диагональные направления (вдоль осей ромба) в экранных (dx, dy).
-DIR_VEC = {'NE': (1, -1), 'SW': (-1, 1), 'NW': (-1, -1), 'SE': (1, 1)}
-DIR_FLIP = {'NE': 'SW', 'SW': 'NE', 'NW': 'SE', 'SE': 'NW'}
-
-
-def pan_and_measure(bgr_before, mon, direction):
-    """Перетянуть карту по диагонали direction и вернуть долю изменений (лог)."""
-    if DRY_RUN:
-        time.sleep(NO_TARGET_WAIT)
-        return 1.0
-    W, H = mon['width'], mon['height']
-    sx = mon['left'] + W // 2
-    sy = mon['top'] + H // 2
-    vx, vy = DIR_VEC[direction]
-    win_input.drag_abs(sx, sy, sx + vx * PAN_DIST, sy + vy * PAN_DIST,
-                       steps=25, duration=PAN_DURATION)
-    time.sleep(PAN_SETTLE)
-    after, _ = grab_screen()
-    return frame_change(bgr_before, after)
 
 
 def pick_confident(stones):
@@ -325,50 +301,12 @@ def main():
     clicks = 0
     recent = []        # [(pos, время)] — недавние клики для кулдауна
     blacklist = []     # [(pos, время)] — ложные/недоступные (no_highlight)
-    empty_pans = 0
-    row_dir = PAN_ROW_START
-    step_dir = PAN_STEP_START
-    row_pans = 0
-    step_count = 0
-    pending_step = False
-
-    def do_pan(bgr, mon, reason):
-        """Пан-обход. Возвращает True если пора остановиться (обошли всё)."""
-        nonlocal empty_pans, last_pos, recent
-        nonlocal row_dir, step_dir, row_pans, step_count, pending_step
-        empty_pans += 1
-        if empty_pans > MAX_EMPTY_PANS:
-            print(f"[{clicks}] {MAX_EMPTY_PANS} панов без целей — стоп (обошли карту).")
-            return True
-
-        if pending_step:
-            direction = step_dir
-            changed = pan_and_measure(bgr, mon, direction)
-            step_count += 1
-            print(f"[{clicks}] {reason} -> шаг '{direction}' "
-                  f"измен={changed*100:.0f}% ряд {step_count}/{PAN_NUM_ROWS} "
-                  f"({empty_pans}/{MAX_EMPTY_PANS})")
-            if step_count >= PAN_NUM_ROWS:
-                step_count = 0
-                step_dir = DIR_FLIP[step_dir]
-                print(f"    -> все ряды пройдены: разворот шага '{step_dir}'")
-            pending_step = False
-        else:
-            direction = row_dir
-            changed = pan_and_measure(bgr, mon, direction)
-            row_pans += 1
-            print(f"[{clicks}] {reason} -> пан '{direction}' "
-                  f"измен={changed*100:.0f}% ряд {row_pans}/{PAN_ROW_LEN} "
-                  f"({empty_pans}/{MAX_EMPTY_PANS})")
-            if row_pans >= PAN_ROW_LEN:
-                row_pans = 0
-                pending_step = True
-                row_dir = DIR_FLIP[row_dir]
-                print(f"    -> ряд пройден: шаг '{step_dir}', обратно '{row_dir}'")
-
-        last_pos = None
-        recent = []
-        return False
+    # пан-обход карты — общий Panner (common/pan.py). Лениво на первый пан.
+    pan_cfg = {'PAN_DIST': PAN_DIST, 'PAN_DURATION': PAN_DURATION,
+               'PAN_SETTLE': PAN_SETTLE, 'PAN_ROW_LEN': PAN_ROW_LEN,
+               'PAN_NUM_ROWS': PAN_NUM_ROWS, 'ROW_START': PAN_ROW_START,
+               'STEP_START': PAN_STEP_START, 'DRY_WAIT': NO_TARGET_WAIT}
+    panner = None
 
     while True:
         if keyboard.is_pressed(HOTKEY_STOP):
@@ -391,6 +329,8 @@ def main():
                 block_until = now + delay   # пока UI активен — НЕ фармить
                 last_pos = None      # после перезахода координаты другие
                 recent = []
+                if panner:
+                    panner.reset()   # карта/координаты другие
                 continue
             next_ui = now + UI_CHECK_INTERVAL
 
@@ -410,14 +350,23 @@ def main():
             target = choose_target(stones, last_pos, anchor_px,
                                    recent_pts, blacklist_pts)
 
-        # нет камней ИЛИ все в чёрном списке -> пан
+        # нет камней ИЛИ все в чёрном списке
         if target is None:
             reason = "камней нет" if not stones else "все цели в чёрном списке"
-            if do_pan(bgr, mon, reason):
-                break
+            if not PAN_ENABLED:
+                time.sleep(NO_TARGET_WAIT)   # пан выключен -> ждём на месте
+                continue
+            if panner is None:
+                panner = Panner(mon, pan_cfg, dry_run=DRY_RUN, tag=str(clicks),
+                                grab=lambda: grab_screen()[0])
+            if panner.step(reason, before=bgr):
+                break                        # карта обойдена -> стоп
+            last_pos = None                  # карта сдвинулась
+            recent = []
             continue
 
-        empty_pans = 0   # есть реальная цель -> сброс счётчика панов
+        if panner:
+            panner.reset()   # есть реальная цель -> сброс счётчика панов
 
         cx, cy = target['click']
         screen_x = cx + mon['left']

@@ -54,6 +54,7 @@ import keyboard
 
 from stone_detector import detect_stones, stone_px
 from reconnect import load_templates, emergency_ui_check
+from pan import Panner
 
 
 # ============================================================
@@ -103,15 +104,17 @@ HARD_CAP = 8.0
 POST_CHOP_PAUSE = (0.1, 0.3)
 DRY_WAIT = 2.0             # в DRY_RUN держим «добычу» столько
 
-# --- Панорамирование (по диагоналям ромба, как в одиночном боте) ---
+# --- Панорамирование (логика общая в common/pan.py, Panner) ---
+PAN_ENABLED = False        # ВЫКЛ по умолчанию: целей нет -> аккаунт ждёт на месте,
+                           # карту НЕ двигает. True -> обход «газонокосилкой».
 PAN_DIST = 380
 PAN_DURATION = 0.6
 PAN_SETTLE = 0.6
 PAN_ROW_LEN = 12
 PAN_NUM_ROWS = 20
-MAX_EMPTY_PANS = 2 * PAN_NUM_ROWS * (PAN_ROW_LEN + 1) + 8
 PAN_ROW_START = 'SW'
 PAN_STEP_START = 'SE'
+PAN_DRY_WAIT = 0.1         # пауза вместо drag в DRY_RUN
 
 # --- Отбор/выбор цели ---
 # ВНИМАНИЕ: квадрант = 1/4 экрана -> камни мельче. Порог площади, возможно,
@@ -124,8 +127,11 @@ BLACKLIST_TTL = 45.0
 
 HOTKEY_STOP = 'q'
 
-DIR_VEC = {'NE': (1, -1), 'SW': (-1, 1), 'NW': (-1, -1), 'SE': (1, 1)}
-DIR_FLIP = {'NE': 'SW', 'SW': 'NE', 'NW': 'SE', 'SE': 'NW'}
+# общий cfg пана для Panner (одинаков для всех квадрантов)
+PAN_CFG = {'PAN_DIST': PAN_DIST, 'PAN_DURATION': PAN_DURATION,
+           'PAN_SETTLE': PAN_SETTLE, 'PAN_ROW_LEN': PAN_ROW_LEN,
+           'PAN_NUM_ROWS': PAN_NUM_ROWS, 'ROW_START': PAN_ROW_START,
+           'STEP_START': PAN_STEP_START, 'DRY_WAIT': PAN_DRY_WAIT}
 
 
 # ============================================================
@@ -134,11 +140,6 @@ DIR_FLIP = {'NE': 'SW', 'SW': 'NE', 'NW': 'SE', 'SE': 'NW'}
 
 def dist(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
-
-
-def frame_change(a, b):
-    diff = cv2.absdiff(a, b)
-    return float(np.count_nonzero(diff.sum(2) > 30)) / (a.shape[0] * a.shape[1])
 
 
 def build_regions():
@@ -254,13 +255,9 @@ class AccountBot:
         self.resume_at = 0.0
         self.last_poll = 0.0
 
-        # пан-обход (счётчики, как в одиночном do_pan)
-        self.empty_pans = 0
-        self.row_dir = PAN_ROW_START
-        self.step_dir = PAN_STEP_START
-        self.row_pans = 0
-        self.step_count = 0
-        self.pending_step = False
+        # пан-обход — общий Panner (drag из центра СВОЕГО квадранта)
+        self.panner = Panner(region, PAN_CFG, dry_run=DRY_RUN, tag=self.tag,
+                             grab=lambda: grab_region(self.region))
 
     # -- помощники --
     def _abs(self, local_xy):
@@ -283,6 +280,7 @@ class AccountBot:
         self.last_pos = None
         self.recent = []
         self.resume_at = 0.0
+        self.panner.reset()   # карта сдвинулась — снейк с начала
 
     def _tick_ui(self, now):
         """
@@ -372,9 +370,18 @@ class AccountBot:
 
         if target is None:
             reason = "нет камней" if not stones else "все в чёрном списке"
-            return self._do_pan(bgr, reason)
+            if not PAN_ENABLED:
+                self.resume_at = now + 1.0   # пан выкл -> ждём на месте
+                return False
+            if self.panner.step(reason, before=bgr):
+                self.state = DONE            # карта обойдена
+                return True
+            self.last_pos = None             # карта сдвинулась
+            self.recent = []
+            self.state = SCAN
+            return False
 
-        self.empty_pans = 0
+        self.panner.reset()
         self.target = target
         d = 0.0 if self.last_pos is None else dist(self.last_pos, target['click'])
 
@@ -444,59 +451,6 @@ class AccountBot:
                 self.state = SCAN
         else:
             self.back = 0
-
-    def _do_pan(self, bgr_before, reason):
-        """Один шаг пан-обхода (короткий блокирующий drag в свой тик).
-        Возвращает True если аккаунт обошёл всю карту -> DONE."""
-        self.empty_pans += 1
-        if self.empty_pans > MAX_EMPTY_PANS:
-            print(f"[{self.tag}] {MAX_EMPTY_PANS} панов без целей — стоп (карта обойдена).")
-            self.state = DONE
-            return True
-
-        if self.pending_step:
-            direction = self.step_dir
-            changed = self._pan(bgr_before, direction)
-            self.step_count += 1
-            print(f"[{self.tag}] {reason} -> шаг '{direction}' "
-                  f"измен={changed*100:.0f}% ряд {self.step_count}/{PAN_NUM_ROWS} "
-                  f"({self.empty_pans}/{MAX_EMPTY_PANS})")
-            if self.step_count >= PAN_NUM_ROWS:
-                self.step_count = 0
-                self.step_dir = DIR_FLIP[self.step_dir]
-            self.pending_step = False
-        else:
-            direction = self.row_dir
-            changed = self._pan(bgr_before, direction)
-            self.row_pans += 1
-            print(f"[{self.tag}] {reason} -> пан '{direction}' "
-                  f"измен={changed*100:.0f}% ряд {self.row_pans}/{PAN_ROW_LEN} "
-                  f"({self.empty_pans}/{MAX_EMPTY_PANS})")
-            if self.row_pans >= PAN_ROW_LEN:
-                self.row_pans = 0
-                self.pending_step = True
-                self.row_dir = DIR_FLIP[self.row_dir]
-
-        self.last_pos = None       # карта сдвинулась
-        self.recent = []
-        self.state = SCAN
-        return False
-
-    def _pan(self, bgr_before, direction):
-        """Drag из ЦЕНТРА своего квадранта по диагонали. Не выходит за регион."""
-        if DRY_RUN:
-            time.sleep(0.1)
-            return 1.0
-        r = self.region
-        sx = r['left'] + r['width'] // 2
-        sy = r['top'] + r['height'] // 2
-        vx, vy = DIR_VEC[direction]
-        win_input.drag_abs(sx, sy, sx + vx * PAN_DIST, sy + vy * PAN_DIST,
-                           steps=25, duration=PAN_DURATION)
-        time.sleep(PAN_SETTLE)
-        after = grab_region(r)
-        return frame_change(bgr_before, after)
-
 
 # ============================================================
 # Планировщик: по кругу тикает 4 аккаунта, владеет единым курсором
