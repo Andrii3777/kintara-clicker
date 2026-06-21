@@ -2,12 +2,12 @@ import time
 import random
 import requests
 import threading
-from config import BOT_TOKEN, CHAT_ID, API_URL, THRESHOLD, POLL_INTERVAL, RESOURCES
+from config import BOT_TOKEN, CHAT_ID, API_URL, POLL_INTERVAL, RESOURCES, NOTIFY_THRESHOLDS
 
 TG_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Track which resources already triggered notification (edge-trigger)
-_notified = set()
+# Tracks (resource, threshold%) already fired — edge-trigger per step
+_notified: set[tuple[str, float]] = set()
 _last_update_id = 0
 
 # Persistent session — reuses TCP connection, keeps cookies
@@ -67,24 +67,27 @@ def check_and_notify(data):
     for res in RESOURCES:
         current = data.get(res, 0)
         goal = data["goals"].get(res, 1)
-        pct = current / goal
+        pct = current / goal * 100
 
-        if pct >= THRESHOLD and res not in _notified:
-            _notified.add(res)
-            alerts.append(
-                f"🚨 <b>{res.upper()}</b> reached {pct*100:.1f}%! "
-                f"({current:,} / {goal:,})"
-            )
-        elif pct < THRESHOLD and res in _notified:
-            # Reset so we notify again if it dips and rises
-            _notified.discard(res)
+        for step in NOTIFY_THRESHOLDS:
+            key = (res, step)
+            if pct >= step and key not in _notified:
+                _notified.add(key)
+                emoji = "🏆" if step == 100 else ("🚨" if step >= 90 else "📊")
+                alerts.append(
+                    f"{emoji} <b>{res.upper()}</b> {step}%"
+                    f" — {current:,} / {goal:,} ({pct:.1f}%)"
+                )
+            elif pct < step and key in _notified:
+                # Dipped below — reset so we fire again if it rises
+                _notified.discard(key)
 
     if alerts:
         send_message("\n".join(alerts))
 
 
 def poll_loop():
-    print(f"[golda-bot] polling every {POLL_INTERVAL}s, threshold={THRESHOLD*100:.0f}%")
+    print(f"[golda-bot] polling every {POLL_INTERVAL}s, steps={NOTIFY_THRESHOLDS}")
     while True:
         try:
             data = fetch_campaign()
