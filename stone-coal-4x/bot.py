@@ -231,6 +231,8 @@ class AccountBot:
         self.templates = templates
         self.target_server = region['target_server']
         self.next_ui = 0.0      # троттл UI-проверки
+        self.block_until = 0.0  # НЕ фармить пока идёт UI-действие (очередь/клик)
+        self.ui_state = {}      # память выбора сервера (скролл/детект низа)
 
         # выбор цели
         self.last_pos = None
@@ -288,14 +290,15 @@ class AccountBot:
         (фарм в этот тик пропускаем). False -> UI нет, фармим дальше.
         """
         bgr = grab_region(self.region)
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        action = emergency_ui_check(gray, self.target_server, self.templates)
+        # OCR-перезаход кормим ЦВЕТНЫМ кадром (в gray теряется текст кнопок).
+        action = emergency_ui_check(bgr, self.target_server, self.templates,
+                                    self.ui_state)
         if action is None:
             self.next_ui = now + UI_CHECK_INTERVAL
             return False
 
         print(f"[{self.tag}] {action['msg']}")
-        self._reset_farm()
+        self._reset_farm()      # НЕ трогает ui_state (память скролла ведёт reconnect)
         act = action['action']
 
         if act == 'wait':
@@ -308,11 +311,15 @@ class AccountBot:
                 win_input.click_abs(ax, ay)
             self.next_ui = now + UI_CLICK_DELAY
         elif act == 'scroll':
-            # клик чуть ВЫШЕ заголовка (фокус) -> курсор в зону списка -> колесо
+            # Фокус на БЕЗОПАСНОЙ точке (заголовок, не карточка!) -> колесо над
+            # списком. focus_x/focus_y = заголовок, x/y = зона колеса.
             if not DRY_RUN:
-                win_input.click_abs(ax, ay - UI_SCROLL_FOCUS_DY)
+                fx, fy = self._abs((action.get('focus_x', action['x']),
+                                    action.get('focus_y',
+                                               action['y'] - UI_SCROLL_FOCUS_DY)))
+                win_input.click_abs(fx, fy)
                 time.sleep(0.1)
-                win_input.scroll(UI_SCROLL_NOTCHES, ax, ay + UI_SCROLL_INTO_DY)
+                win_input.scroll(UI_SCROLL_NOTCHES, ax, ay)
             self.next_ui = now + UI_SCROLL_DELAY
         return True
 
@@ -325,7 +332,12 @@ class AccountBot:
         # перезаход на сервер — высший приоритет, свой троттл next_ui
         if now >= self.next_ui:
             if self._tick_ui(now):
+                self.block_until = self.next_ui   # пока UI активен — НЕ фармить
                 return False
+
+        # UI-действие в процессе (очередь/перезаход) — фарм не трогаем
+        if now < self.block_until:
+            return False
 
         # троттл: один аккаунт не чаще CHOP_POLL (другие тикают свободно)
         if now - self.last_poll < CHOP_POLL:
@@ -501,10 +513,8 @@ def main():
         print(f"    {r['name']}: left={r['left']} top={r['top']} "
               f"{r['width']}x{r['height']}  сервер={r['target_server']}")
     templates = load_templates(UI_DIR)
-    missing = [n for n, t in templates.items() if t is None]
-    print(f"  UI-шаблоны: {UI_DIR}")
-    if missing:
-        print(f"  ВНИМАНИЕ: нет шаблонов {missing} — перезаход для них не сработает.")
+    if templates.get('_ocr') is None:
+        print("  ВНИМАНИЕ: OCR недоступен — перезаход выключен (фарм работает).")
     print(f"  Стоп: '{HOTKEY_STOP}'")
     print("=" * 56)
     print("Старт через 3 сек — разложи 4 окна по квадрантам...")

@@ -4,95 +4,247 @@ reconnect.py
 ============
 Слой ПЕРЕЗАХОДА на сервер. ОБЩИЙ для всех ботов (как win_input).
 
-Логика взята из стороннего скрипта: ловим UI-попапы дисконнекта/очереди/ошибки
-и меню выбора сервера через matchTemplate, возвращаем действие. Сам клик/скролл
-делает бот (через win_input). Тут — ТОЛЬКО зрение, без захвата экрана и мыши.
+ЗРЕНИЕ перезахода через OCR (RapidOCR / onnxruntime): читаем ТЕКСТ кнопок и
+строк меню, а не пиксель-точные шаблоны. Масштаб/разрешение/монитор-независимо.
+Сам клик/скролл делает бот (через win_input). Тут — ТОЛЬКО зрение.
 
-Поток (приоритет сверху вниз, emergency_ui_check):
-  wait        -> в очереди, сервер стартует -> ждать, ничего не жать
-  ok          -> попап вылета -> клик OK
-  error/RETRY -> ошибка коннекта -> клик RETRY
-  server_N    -> нужный сервер виден -> клик, заходим
-  server_list -> список открыт, сервера не видно -> скролл вниз искать
+РЕАЛЬНЫЙ ФЛОУ ИГРЫ (по debug-скринам):
+  1. "SELECT A SERVER" / "CHOOSE YOUR REALM" — список миров. Скроллить.
+     - KINTARA CLUB N  — "MEMBERS ONLY" платный → ПРОПУСКАЕМ (нет queue/instant).
+     - SERVER N        — бесплатный:
+         "OPEN · JOIN INSTANTLY"  → приоритет 1, заходим сразу.
+         "FULL · X IN QUEUE"      → берём наименьший X если открытых нет.
+  2. Выбрали → "YOU ARE IN QUEUE" (players ahead) → ЖДЁМ, ничего не жмём.
+  3. В очереди может выскочить "SOMETHING WENT WRONG" / "CONNECTION ERROR" →
+     жмём RETRY → заново выбираем сервер.
 
-Шаблоны сняты на ЧУЖОМ разрешении -> matchTemplate мульти-скейлом терпит
-небольшую разницу, но при сильном расхождении ПЕРЕСНЯТЬ под свой экран.
-Координаты в действиях — ЛОКАЛЬНЫЕ внутри региона (бот добавит offset региона).
+Приоритет emergency_ui_check (сверху вниз):
+  RETRY/ошибка → click RETRY
+  очередь (players ahead / you are in queue) → wait
+  loading/connecting → wait
+  OK (попап вылета) → click
+  Play Now (главное меню) → click
+  список серверов → выбор открытого / наименьшей очереди / скролл
+
+СОСТОЯНИЕ: выбор сервера требует памяти между кадрами (скролл по списку в поисках
+открытого, детект низа). Бот передаёт per-account dict `state`; reconnect его ведёт.
+Нет state → выбор всё равно работает (скроллит ища instant), но не «коммитит»
+наименьшую очередь (нет памяти низа).
+
+Координаты в действиях — ЛОКАЛЬНЫЕ внутри региона (бот добавит offset).
+scroll-действие несёт focus_x/focus_y (безопасная точка фокуса — заголовок, НЕ
+карточка) + x/y (точка колеса над списком).
 """
 
-import os
+import re
 import cv2
 
+MIN_CONF = 0.50          # минимальная уверенность OCR
+MAX_SCROLLS = 15         # потолок скроллов списка (страховка от джиттера OCR)
 
-TEMPLATE_NAMES = ['ok', 'error', 'wait', 'server_list',
-                  'server_2', 'server_3', 'server_4']
+# "FULL · 20 IN QUEUE" / "FULL·15INQUEUE" / "FULL-12IN QUEUE" -> число очереди
+QUEUE_RE = re.compile(r"(\d+)\s*IN\s*QUEUE")
 
-# Масштабы для подгонки под чужое разрешение (matchTemplate не масштаб-инвариантен)
-SCALES = [1.0, 0.95, 0.90, 0.85, 0.80, 1.05, 1.10]
-
-
-def load_templates(ui_dir):
-    """Загрузить PNG-шаблоны из ui_dir в gray. Нет файла -> None под именем."""
-    templates = {}
-    for name in TEMPLATE_NAMES:
-        path = os.path.join(ui_dir, f"{name}.png")
-        templates[name] = (cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-                           if os.path.exists(path) else None)
-    return templates
+_OCR = None
+_OCR_FAILED = False
 
 
-def check_ui_element(gray_img, template, threshold=0.92):
-    """Мульти-скейл matchTemplate. Нашёл -> (cx,cy) центра совпадения, иначе None."""
-    if template is None:
-        return None
-    for scale in SCALES:
-        w = int(template.shape[1] * scale)
-        h = int(template.shape[0] * scale)
-        if (w < 10 or h < 10
-                or w > gray_img.shape[1] or h > gray_img.shape[0]):
-            continue
-        resized = cv2.resize(template, (w, h))
-        res = cv2.matchTemplate(gray_img, resized, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(res)
-        if max_val >= threshold:
-            return (max_loc[0] + w // 2, max_loc[1] + h // 2)
+def _get_ocr():
+    """Синглтон RapidOCR. Нет пакета -> None (перезаход выключится, фарм живёт)."""
+    global _OCR, _OCR_FAILED
+    if _OCR is not None or _OCR_FAILED:
+        return _OCR
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        _OCR = RapidOCR()
+    except Exception as e:
+        _OCR_FAILED = True
+        print(f"  [reconnect] OCR недоступен ({e}) — перезаход отключён. "
+              f"pip install rapidocr_onnxruntime")
+    return _OCR
+
+
+def load_templates(ui_dir=None):
+    """
+    Совместимость со старым контрактом ботов (templates.items(), missing-check).
+    Возвращает dict {'_ocr': engine}. ui_dir не используется (OCR не нужны PNG).
+    """
+    return {"_ocr": _get_ocr()}
+
+
+# --- OCR --------------------------------------------------------------------
+def _box_center(box):
+    xs = [p[0] for p in box]
+    ys = [p[1] for p in box]
+    return (int(sum(xs) / 4), int(sum(ys) / 4))
+
+
+def _run_ocr(engine, frame):
+    """OCR -> список (text_upper, center, conf). Кормить ЦВЕТНОЙ кадр (gray
+    теряет текст на цветных кнопках)."""
+    if engine is None:
+        return []
+    img = (cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+           if frame.ndim == 2 else frame)
+    result, _ = engine(img)
+    if not result:
+        return []
+    return [(text.upper().strip(), _box_center(box), float(conf))
+            for box, text, conf in result]
+
+
+def _find(items, *keywords, min_conf=MIN_CONF):
+    """Первый бокс, содержащий ЛЮБОЕ keyword (подстрока). center или None."""
+    for text, center, conf in items:
+        if conf >= min_conf and any(k in text for k in keywords):
+            return center
     return None
 
 
-def emergency_ui_check(gray_img, target_server, templates):
+def _find_multi(items, keywords, min_conf=MIN_CONF):
+    """Кросс-бокс: каждое keyword в КАКОМ-ТО боксе (OCR дробит фразы). center
+    бокса с первым keyword, иначе None."""
+    centers = {}
+    for text, center, conf in items:
+        if conf < min_conf:
+            continue
+        for k in keywords:
+            if k in text:
+                centers.setdefault(k, center)
+    if all(k in centers for k in keywords):
+        return centers[keywords[0]]
+    return None
+
+
+# --- Парс списка серверов ---------------------------------------------------
+def _parse_servers(items):
     """
-    Проверить кадр (gray) на UI перезахода. Вернуть dict действия или None.
-    target_server: 'server_2'|'server_3'|'server_4' — какой сервер этого аккаунта.
-
-    Действия:
-      {'action':'wait'}                      — ждать (ничего не жать)
-      {'action':'click','x':..,'y':..}       — клик в (x,y) локально
-      {'action':'scroll','x':..,'y':..}      — мотать список от (x,y) заголовка
+    Бесплатные сервера из видимого списка. Платные (KINTARA CLUB / MEMBERS ONLY)
+    отсекаются сами: у них нет строки "IN QUEUE"/"INSTANTLY".
+    Вернуть [{'q':int(0=open), 'instant':bool, 'center':(x,y)}].
     """
-    if check_ui_element(gray_img, templates.get('wait'), threshold=0.95):
-        return {"action": "wait", "msg": "Очередь/запуск сервера — жду."}
+    servers = []
+    for text, center, conf in items:
+        if conf < MIN_CONF:
+            continue
+        if "INSTANTLY" in text:
+            servers.append({"q": 0, "instant": True, "center": center})
+            continue
+        m = QUEUE_RE.search(text)
+        if m:
+            servers.append({"q": int(m.group(1)), "instant": False,
+                            "center": center})
+    return servers
 
-    ok_pos = check_ui_element(gray_img, templates.get('ok'), threshold=0.90)
-    if ok_pos:
-        return {"action": "click", "x": ok_pos[0], "y": ok_pos[1],
-                "msg": "Вылет — жму OK."}
 
-    error_pos = check_ui_element(gray_img, templates.get('error'), threshold=0.90)
-    if error_pos:
-        return {"action": "click", "x": error_pos[0], "y": error_pos[1],
-                "msg": "Ошибка коннекта — жму RETRY."}
+def _server_select(items, state):
+    """Решение на экране выбора сервера. dict действия (click/scroll)."""
+    st = state if isinstance(state, dict) else {}
 
-    # строгий порог: не путать заголовок с кнопками
-    srv_pos = check_ui_element(gray_img, templates.get(target_server),
-                               threshold=0.93)
-    if srv_pos:
-        return {"action": "click", "x": srv_pos[0], "y": srv_pos[1],
-                "msg": f"Нашёл {target_server} — захожу."}
+    # заголовок = безопасная точка фокуса для скролла (НЕ карточка)
+    title = _find(items, "SELECT A SERVER", "SELECT", "REALM")
 
-    list_pos = check_ui_element(gray_img, templates.get('server_list'),
-                                threshold=0.90)
-    if list_pos:
-        return {"action": "scroll", "x": list_pos[0], "y": list_pos[1],
-                "msg": f"{target_server} не виден — мотаю список."}
+    servers = _parse_servers(items)
+
+    # 1) Открытый сервер виден -> заходим сразу (нет очереди).
+    instant = [s for s in servers if s["instant"]]
+    if instant:
+        st.clear()
+        c = instant[0]["center"]
+        return {"action": "click", "x": c[0], "y": c[1],
+                "msg": "Открытый сервер (JOIN INSTANTLY) — захожу."}
+
+    # точка колеса — над списком (центр видимых строк)
+    pts = ([s["center"] for s in servers]
+           or [c for t, c, cf in items
+               if cf >= MIN_CONF and (title is None or c[1] > title[1] + 40)])
+    if pts:
+        xs = sorted(p[0] for p in pts)
+        ys = sorted(p[1] for p in pts)
+        wheel = (xs[len(xs) // 2], ys[len(ys) // 2])
+    else:
+        wheel = title or (0, 0)
+
+    # 2) Открытых нет. Детект низа: сигнатура очередей не меняется после скролла
+    #    ИЛИ исчерпан лимит скроллов -> коммитим наименьшую очередь.
+    sig = tuple(sorted(s["q"] for s in servers))
+    scrolls = st.get("scrolls", 0)
+    bottom = servers and (sig == st.get("prev_sig") or scrolls >= MAX_SCROLLS)
+    if bottom:
+        st.clear()
+        best = min(servers, key=lambda s: s["q"])
+        c = best["center"]
+        return {"action": "click", "x": c[0], "y": c[1],
+                "msg": f"Открытых нет — беру наименьшую очередь ({best['q']})."}
+
+    # 3) Иначе мотаем список дальше (ищем открытый / доходим до низа).
+    st["prev_sig"] = sig if servers else st.get("prev_sig")
+    st["scrolls"] = scrolls + 1
+    act = {"action": "scroll", "x": wheel[0], "y": wheel[1],
+           "msg": "Список серверов — мотаю искать открытый."}
+    if title:
+        act["focus_x"], act["focus_y"] = title  # фокус на заголовок, не карточку
+    return act
+
+
+def emergency_ui_check(frame, target_server=None, templates=None, state=None):
+    """
+    Кадр (ЛУЧШЕ цветной BGR) -> dict действия перезахода или None.
+    target_server — НЕ используется (оставлен для совместимости). state — per-account
+    dict памяти для выбора сервера (см. модульный docstring).
+
+    Действия (координаты ЛОКАЛЬНЫЕ внутри региона):
+      {'action':'wait'}
+      {'action':'click','x','y'}
+      {'action':'scroll','x','y'[, 'focus_x','focus_y']}
+    """
+    engine = templates.get("_ocr") if isinstance(templates, dict) else _get_ocr()
+    items = _run_ocr(engine, frame)
+    if not items:
+        return None
+    joined = " ".join(t for t, _, c in items if c >= MIN_CONF)
+
+    # 1) Ошибка коннекта -> RETRY (ВЫШЕ очереди: текст ошибки содержит "queue").
+    if (_find(items, "RETRY", min_conf=0.40)
+            or _find_multi(items, ("WENT", "WRONG"))
+            or _find_multi(items, ("CONNECTION", "ERROR"))):
+        pos = _find(items, "RETRY", min_conf=0.40)
+        if pos:
+            if isinstance(state, dict):
+                state.clear()
+            return {"action": "click", "x": pos[0], "y": pos[1],
+                    "msg": "Ошибка коннекта — жму RETRY."}
+
+    # 2) В очереди -> ждать (специфичные фразы, не путать со списком "IN QUEUE").
+    if any(k in joined for k in ("PLAYERS AHEAD", "YOU ARE IN",
+                                 "ENTER AUTOMATICALLY")):
+        if isinstance(state, dict):
+            state.clear()
+        return {"action": "wait", "msg": "В очереди — жду."}
+
+    # 3) Загрузка / коннект -> ждать.
+    if any(k in joined for k in ("LOADING", "CONNECTING", "STARTING")):
+        return {"action": "wait", "msg": "Загрузка/коннект — жду."}
+
+    # 4) Попап вылета -> OK (точный токен, чат "OKOK" не считается).
+    for text, center, conf in items:
+        if conf >= MIN_CONF and text in ("OK", "ОК"):
+            if isinstance(state, dict):
+                state.clear()
+            return {"action": "click", "x": center[0], "y": center[1],
+                    "msg": "Вылет — жму OK."}
+
+    # 5) Главное меню -> Play Now (оба слова, иначе ловит "PLAYER1").
+    pos = _find_multi(items, ("PLAY", "NOW"))
+    if pos:
+        if isinstance(state, dict):
+            state.clear()
+        return {"action": "click", "x": pos[0], "y": pos[1],
+                "msg": "Главное меню — жму Play Now."}
+
+    # 6) Экран выбора сервера (заголовок ИЛИ распознаны строки серверов).
+    if (_find_multi(items, ("SELECT", "SERVER")) or "REALM" in joined
+            or _parse_servers(items)):
+        return _server_select(items, state)
 
     return None

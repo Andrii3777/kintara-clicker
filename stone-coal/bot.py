@@ -265,14 +265,15 @@ def wait_until_mined(stone_pos, dist_px):
 # Перезаход на сервер
 # ============================================================
 
-def check_reconnect(bgr, mon, templates):
+def check_reconnect(bgr, mon, templates, state):
     """
-    UI-перезаход (высший приоритет). Кадр -> matchTemplate -> действие.
+    UI-перезаход (высший приоритет). Кадр -> OCR -> действие.
     Вернуть задержку next_ui (сек) если было действие, иначе None (UI нет).
-    Координаты шаблона локальные -> добавляем смещение монитора.
+    Координаты действия локальные -> добавляем смещение монитора.
+    state — dict памяти выбора сервера (скролл/детект низа).
     """
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    action = emergency_ui_check(gray, TARGET_SERVER, templates)
+    # OCR-перезаход кормим ЦВЕТНЫМ кадром (в gray теряется текст кнопок).
+    action = emergency_ui_check(bgr, TARGET_SERVER, templates, state)
     if action is None:
         return None
     print(f"  [UI] {action['msg']}")
@@ -286,11 +287,14 @@ def check_reconnect(bgr, mon, templates):
             win_input.click_abs(ax, ay)
         return UI_CLICK_DELAY
     if act == 'scroll':
-        # клик чуть ВЫШЕ заголовка (фокус) -> курсор в зону списка -> колесо
+        # Фокус окна на БЕЗОПАСНОЙ точке (заголовок, не карточка!) -> колесо над
+        # списком. reconnect отдаёт focus_x/focus_y (заголовок) и x/y (зона колеса).
         if not DRY_RUN:
-            win_input.click_abs(ax, ay - UI_SCROLL_FOCUS_DY)
+            fx = action.get('focus_x', action['x']) + mon['left']
+            fy = action.get('focus_y', action['y'] - UI_SCROLL_FOCUS_DY) + mon['top']
+            win_input.click_abs(fx, fy)
             time.sleep(0.1)
-            win_input.scroll(UI_SCROLL_NOTCHES, ax, ay + UI_SCROLL_INTO_DY)
+            win_input.scroll(UI_SCROLL_NOTCHES, ax, ay)
         return UI_SCROLL_DELAY
     return None
 
@@ -311,10 +315,11 @@ def main():
     time.sleep(3)
 
     templates = load_templates(UI_DIR)
-    missing = [n for n, t in templates.items() if t is None]
-    if missing:
-        print(f"  ВНИМАНИЕ: нет UI-шаблонов {missing} — перезаход для них не сработает.")
+    if templates.get('_ocr') is None:
+        print("  ВНИМАНИЕ: OCR недоступен — перезаход выключен (фарм работает).")
     next_ui = 0.0      # троттл UI-проверки перезахода
+    block_until = 0.0  # НЕ фармить пока идёт UI-действие (очередь/клик/скролл)
+    ui_state = {}      # память выбора сервера (скролл по списку, детект низа)
 
     last_pos = None
     clicks = 0
@@ -380,13 +385,19 @@ def main():
 
         # перезаход на сервер — высший приоритет (свой троттл next_ui)
         if now >= next_ui:
-            delay = check_reconnect(bgr, mon, templates)
+            delay = check_reconnect(bgr, mon, templates, ui_state)
             if delay is not None:
                 next_ui = now + delay
+                block_until = now + delay   # пока UI активен — НЕ фармить
                 last_pos = None      # после перезахода координаты другие
                 recent = []
                 continue
             next_ui = now + UI_CHECK_INTERVAL
+
+        # UI-действие в процессе (очередь/перезаход) — камень не трогаем
+        if now < block_until:
+            time.sleep(0.05)
+            continue
 
         H, W = bgr.shape[:2]
         anchor_px = (int(CHAR_ANCHOR[0] * W), int(CHAR_ANCHOR[1] * H))
