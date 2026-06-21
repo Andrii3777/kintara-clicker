@@ -9,3 +9,6 @@ debug_brown_mask.png
 before.png
 after.png
 dbg_*.png
+
+# Secrets
+golda-bot/config.py
