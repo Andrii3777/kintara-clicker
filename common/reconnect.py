@@ -41,6 +41,7 @@ import cv2
 
 MIN_CONF = 0.50          # минимальная уверенность OCR
 MAX_SCROLLS = 15         # потолок скроллов списка (страховка от джиттера OCR)
+OCR_UPSCALE_TO = 1600    # кадр уже этого по ширине -> апскейл (мелкий текст x4)
 
 # Зоны-мусор (доли кадра), где OCR ловит НЕ попапы: верх браузера (вкладки/адрес/
 # закладки — "kintara.gg/play"), чат снизу-слева ("donate now"), таскбар. Попапы
@@ -96,11 +97,23 @@ def _run_ocr(engine, frame):
         return []
     img = (cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
            if frame.ndim == 2 else frame)
+    # АПСКЕЙЛ мелких кадров (x4 квадрант ~640px): иначе OCR не читает строки
+    # серверов (текст ~10px). Координаты делим обратно на scale.
+    h, w = img.shape[:2]
+    scale = 1.0
+    if w < OCR_UPSCALE_TO:
+        scale = OCR_UPSCALE_TO / w
+        img = cv2.resize(img, (int(w * scale), int(h * scale)),
+                         interpolation=cv2.INTER_CUBIC)
     result, _ = engine(img)
     if not result:
         return []
-    return [(text.upper().strip(), _box_center(box), float(conf))
-            for box, text, conf in result]
+    out = []
+    for box, text, conf in result:
+        cx, cy = _box_center(box)
+        out.append((text.upper().strip(),
+                    (int(cx / scale), int(cy / scale)), float(conf)))
+    return out
 
 
 def _find(items, *keywords, min_conf=MIN_CONF):
@@ -280,6 +293,17 @@ def emergency_ui_check(frame, target_server=None, templates=None, state=None):
             state.clear()
         return {"action": "click", "x": pos[0], "y": pos[1],
                 "msg": "Главное меню — жму Play Now."}
+
+    # 5b) Случайно зашли на платный (KINTARA CLUB / MEMBERS ONLY / PAID IN SOL) ->
+    #     кнопка "Back to servers". ВЫШЕ выбора сервера: экран подписки содержит
+    #     "CHOOSE A PLAN ... REALM" -> иначе ложно считается списком серверов.
+    #     Требуем оба слова В ОДНОМ боксе ("BACK TO SERVERS") — не ник игрока "Back".
+    for text, center, conf in items:
+        if conf >= MIN_CONF and "BACK" in text and "SERVER" in text:
+            if isinstance(state, dict):
+                state.clear()
+            return {"action": "click", "x": center[0], "y": center[1],
+                    "msg": "Платный сервер — жму Back to servers."}
 
     # 6) Экран выбора сервера. Заголовок строго ДВУМЯ словами вместе
     #    ("SELECT A SERVER"/"CHOOSE YOUR REALM") ИЛИ распознаны строки серверов.
