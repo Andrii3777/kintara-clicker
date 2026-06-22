@@ -237,12 +237,12 @@ def emergency_ui_check(frame, target_server=None, templates=None, state=None):
       {'action':'scroll','x','y'[, 'focus_x','focus_y']}
     """
     engine = templates.get("_ocr") if isinstance(templates, dict) else _get_ocr()
-    items = _run_ocr(engine, frame)
-    if not items:
+    all_items = _run_ocr(engine, frame)   # полный список до фильтрации (нужен для Play Now)
+    if not all_items:
         return None
     # выкинуть текст из зон-мусора (браузер/чат/таскбар) — попапы только по центру
     H, W = frame.shape[:2]
-    items = [it for it in items if not _in_ignore(it[1], W, H)]
+    items = [it for it in all_items if not _in_ignore(it[1], W, H)]
     if not items:
         return None
     joined = " ".join(t for t, _, c in items if c >= MIN_CONF)
@@ -286,12 +286,27 @@ def emergency_ui_check(frame, target_server=None, templates=None, state=None):
         return {"action": "click", "x": pos[0], "y": pos[1],
                 "msg": "Торговец ушёл — жму Safe travels."}
 
-    # 5) Главное меню -> Play Now (оба слова, иначе ловит "PLAYER1").
-    pos = _find_multi(items, ("PLAY", "NOW"))
-    if pos:
+    # 5) Главное меню / профиль -> Play Now.
+    # Порядок: 1) оба слова в ОДНОМ боксе (надёжнее), 2) кросс-бокс в отфильтрованных,
+    # 3) одиночный бокс в НЕотфильтрованных (страховка: кнопка у края зоны чата
+    # при высоком браузере).
+    _play_now_pos = None
+    for _text, _center, _conf in items:
+        if _conf >= MIN_CONF and "PLAY" in _text and "NOW" in _text:
+            _play_now_pos = _center
+            break
+    if _play_now_pos is None:
+        _play_now_pos = _find_multi(items, ("PLAY", "NOW"))
+    if _play_now_pos is None:
+        for _text, _center, _conf in all_items:
+            if _conf >= MIN_CONF and "PLAY" in _text and "NOW" in _text:
+                _play_now_pos = _center
+                break
+    if _play_now_pos:
         if isinstance(state, dict):
             state.clear()
-        return {"action": "click", "x": pos[0], "y": pos[1],
+        return {"action": "click", "x": _play_now_pos[0], "y": _play_now_pos[1],
+                "action_type": "play_now",
                 "msg": "Главное меню — жму Play Now."}
 
     # 5b) Случайно зашли на платный (KINTARA CLUB / MEMBERS ONLY / PAID IN SOL) ->

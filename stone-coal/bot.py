@@ -43,6 +43,7 @@ import keyboard
 from stone_detector import detect_stones, stone_px
 from reconnect import load_templates, emergency_ui_check
 from pan import Panner, zoom_map
+from tool_select import select_tool
 
 
 # ============================================================
@@ -93,7 +94,7 @@ PAN_ROW_START = 'SW'      # ось ряда: 'SW'(↙) <-> 'NE'(↗)
 PAN_STEP_START = 'SE'     # ось шага: 'SE'(↘) <-> 'NW'(↖)
 
 # --- Zoom карты после входа на сервер (общий, common/pan.py) ---
-ZOOM_ON_ENTER = True      # после захода на сервер уменьшить карту колесом
+ZOOM_ON_ENTER = False     # после захода на сервер уменьшить карту колесом
 ZOOM_NOTCHES = -1         # <0 вниз (обычно zoom out; наоборот -> поставь >0)
 ZOOM_TIMES = 6            # сколько полных прокрутов
 
@@ -122,8 +123,17 @@ UI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                       "..", "common", "ui")
 TARGET_SERVER = "server_2"   # на какой сервер заходит этот аккаунт
 UI_CHECK_INTERVAL = 1.0      # как часто сканить UI когда спокойно, сек
-UI_CLICK_DELAY = 2.5         # пауза после клика по UI, сек
+UI_CLICK_DELAY = 2.5         # пауза после обычного клика UI, сек
+UI_PLAY_NOW_DELAY = 5.0      # пауза после клика Play Now — даём сервер-листу загрузиться
 UI_WAIT_DELAY = 4.0          # пауза если «в очереди», сек
+UI_ENTRY_CONFIRM = 2         # сколько подряд «нет UI» проверок перед zoom/фармом после UI
+
+# --- Выбор инструмента после входа в мир ---
+TOOL_SELECT_ENABLED = True   # автовыбор инструмента при входе в мир
+TOOL_TARGET = "Pickaxe"      # для камня/угля — кирка
+# Позиции слотов хотбара (доли экрана). Подбери если слоты не совпадают.
+HOTBAR_SLOT_Y   = 0.88
+HOTBAR_SLOTS_X  = [0.40, 0.44, 0.49, 0.53, 0.57, 0.62]  # 6 слотов, центр экрана
 UI_SCROLL_DELAY = 1.8        # пауза после шага скролла списка, сек
 UI_SCROLL_FOCUS_DY = 15      # клик на столько px ВЫШЕ заголовка (фокус окна)
 UI_SCROLL_INTO_DY = 150      # курсор на столько px НИЖЕ заголовка (в зону списка)
@@ -266,7 +276,8 @@ def check_reconnect(bgr, mon, templates, state):
     if act == 'click':
         if not DRY_RUN:
             win_input.click_abs(ax, ay)
-        return UI_CLICK_DELAY
+        return (UI_PLAY_NOW_DELAY if action.get('action_type') == 'play_now'
+                else UI_CLICK_DELAY)
     if act == 'scroll':
         # Фокус-клик ТОЛЬКО если reconnect дал безопасную точку (заголовок).
         # Нет focus_x -> заголовок не распознан -> НЕ кликаем (иначе попадём по
@@ -302,6 +313,7 @@ def main():
     next_ui = 0.0      # троттл UI-проверки перезахода
     block_until = 0.0  # НЕ фармить пока идёт UI-действие (очередь/клик/скролл)
     ui_state = {}      # память выбора сервера (скролл по списку, детект низа)
+    no_ui_streak = 0   # кол-во подряд «нет UI» при was_in_ui=True
 
     last_pos = None
     clicks = 0
@@ -337,9 +349,14 @@ def main():
                 last_pos = None      # после перезахода координаты другие
                 recent = []
                 was_in_ui = True     # были в UI -> при выходе в мир зумнём
+                no_ui_streak = 0
                 if panner:
                     panner.reset()   # карта/координаты другие
                 continue
+            if was_in_ui:
+                no_ui_streak += 1
+            else:
+                no_ui_streak = 0
             next_ui = now + UI_CHECK_INTERVAL
 
         # UI-действие в процессе (очередь/перезаход) — камень не трогаем
@@ -347,16 +364,27 @@ def main():
             time.sleep(0.05)
             continue
 
-        # вошли в мир после UI/перезахода -> уменьшить карту (один раз)
+        # вошли в мир после UI/перезахода -> уменьшить карту + выбрать инструмент.
+        # Требуем UI_ENTRY_CONFIRM подряд «нет UI» — не зумить на загружающейся странице.
         if was_in_ui:
+            if no_ui_streak < UI_ENTRY_CONFIRM:
+                time.sleep(0.05)
+                continue
+            no_ui_streak = 0
             was_in_ui = False
             if ZOOM_ON_ENTER:
                 zoom_map(mon, ZOOM_NOTCHES, ZOOM_TIMES, dry_run=DRY_RUN)
-                last_pos = None
-                recent = []
-                if panner:
-                    panner.reset()
-                continue
+            if TOOL_SELECT_ENABLED:
+                select_tool(mon, TOOL_TARGET, templates,
+                            grab_fn=lambda: grab_screen()[0],
+                            slot_x_fracs=HOTBAR_SLOTS_X,
+                            slot_y_frac=HOTBAR_SLOT_Y,
+                            dry_run=DRY_RUN)
+            last_pos = None
+            recent = []
+            if panner:
+                panner.reset()
+            continue
 
         H, W = bgr.shape[:2]
         anchor_px = (int(CHAR_ANCHOR[0] * W), int(CHAR_ANCHOR[1] * H))

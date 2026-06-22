@@ -55,6 +55,7 @@ import keyboard
 from tree_detector import detect_trees, highlight_count
 from reconnect import load_templates, emergency_ui_check
 from pan import Panner, zoom_map
+from tool_select import select_tool
 
 
 # ============================================================
@@ -86,8 +87,17 @@ QUADRANT_TR_SERVER = "server_3"   # право-верх
 QUADRANT_BL_SERVER = "server_4"   # лево-низ
 QUADRANT_BR_SERVER = "server_2"   # право-низ (поправь под нужный сервер)
 UI_CHECK_INTERVAL = 1.0    # как часто сканить UI когда спокойно, сек
-UI_CLICK_DELAY = 2.5       # пауза после клика по UI, сек
+UI_CLICK_DELAY = 2.5       # пауза после обычного клика UI, сек
+UI_PLAY_NOW_DELAY = 5.0    # пауза после клика Play Now — даём сервер-листу загрузиться
 UI_WAIT_DELAY = 4.0        # пауза если «в очереди», сек
+UI_ENTRY_CONFIRM = 2       # сколько подряд «нет UI» проверок перед zoom/фармом после UI
+
+# --- Выбор инструмента после входа в мир ---
+TOOL_SELECT_ENABLED = True   # автовыбор инструмента при входе в мир
+TOOL_TARGET = "Axe"          # для дерева — топор
+# Позиции слотов хотбара (доли КВАДРАНТА). Подбери если слоты не совпадают.
+HOTBAR_SLOT_Y   = 0.88
+HOTBAR_SLOTS_X  = [0.40, 0.44, 0.49, 0.53, 0.57, 0.62]  # 6 слотов, центр экрана
 UI_SCROLL_DELAY = 1.8      # пауза после шага скролла списка, сек
 UI_SCROLL_FOCUS_DY = 15    # клик на столько px ВЫШЕ заголовка (фокус окна)
 UI_SCROLL_INTO_DY = 150    # курсор на столько px НИЖЕ заголовка (в зону списка)
@@ -119,7 +129,7 @@ PAN_STEP_START = 'SE'
 PAN_DRY_WAIT = 0.1         # пауза вместо drag в DRY_RUN
 
 # --- Zoom карты после входа на сервер (общий, common/pan.py) ---
-ZOOM_ON_ENTER = True       # после захода уменьшить карту колесом
+ZOOM_ON_ENTER = False      # после захода уменьшить карту колесом
 ZOOM_NOTCHES = -1          # <0 вниз (обычно zoom out; наоборот -> >0)
 ZOOM_TIMES = 6             # сколько полных прокрутов
 
@@ -267,6 +277,7 @@ class AccountBot:
         self.panner = Panner(region, PAN_CFG, dry_run=DRY_RUN, tag=self.tag,
                              grab=lambda: grab_region(self.region))
         self.was_in_ui = True   # True на старте -> при первом входе в мир зумим
+        self.no_ui_streak = 0   # кол-во подряд «нет UI» при was_in_ui=True
 
     # -- помощники --
     def _abs(self, local_xy):
@@ -294,28 +305,42 @@ class AccountBot:
 
     def _tick_ui(self, now):
         """
-        UI/перезаход — высший приоритет. Вернуть True если было UI-действие
-        (фарм в этот тик пропускаем). False -> UI нет, фармим дальше.
+        UI/перезаход — высший приоритет. Вернуть True если було UI-дія або очікуємо
+        підтвердження входу в гру (фарм у цей тік пропускаємо). False -> UI немає і
+        was_in_ui=False -> фармимо.
         """
         bgr = grab_region(self.region)
-        # OCR-перезаход кормим ЦВЕТНЫМ кадром (в gray теряется текст кнопок).
         action = emergency_ui_check(bgr, self.target_server, self.templates,
                                     self.ui_state)
         if action is None:
             self.next_ui = now + UI_CHECK_INTERVAL
-            # вошли в мир после UI/перезахода -> уменьшить карту (один раз)
             if self.was_in_ui:
-                self.was_in_ui = False
-                if ZOOM_ON_ENTER:
-                    zoom_map(self.region, ZOOM_NOTCHES, ZOOM_TIMES,
-                             dry_run=DRY_RUN, log=lambda m: print(f"[{self.tag}]{m}"))
+                self.no_ui_streak += 1
+                if self.no_ui_streak >= UI_ENTRY_CONFIRM:
+                    # Підтверджено: UI нема UI_ENTRY_CONFIRM разів поспіль -> входимо в світ
+                    self.no_ui_streak = 0
+                    self.was_in_ui = False
+                    if ZOOM_ON_ENTER:
+                        zoom_map(self.region, ZOOM_NOTCHES, ZOOM_TIMES,
+                                 dry_run=DRY_RUN, log=lambda m: print(f"[{self.tag}]{m}"))
+                    if TOOL_SELECT_ENABLED:
+                        select_tool(self.region, TOOL_TARGET, self.templates,
+                                    grab_fn=lambda: grab_region(self.region),
+                                    slot_x_fracs=HOTBAR_SLOTS_X,
+                                    slot_y_frac=HOTBAR_SLOT_Y,
+                                    dry_run=DRY_RUN,
+                                    log=lambda m: print(f"[{self.tag}]{m}"))
                     self._reset_farm()
                     return True   # тик потрачен на zoom
+                # Ещё не уверены — блокируем фарм до следующей проверки
+                return True
+            self.no_ui_streak = 0
             return False
 
         print(f"[{self.tag}] {action['msg']}")
         self._reset_farm()      # НЕ трогает ui_state (память скролла ведёт reconnect)
         self.was_in_ui = True   # были в UI -> при выходе в мир зумнём
+        self.no_ui_streak = 0
         act = action['action']
 
         if act == 'wait':
@@ -326,7 +351,10 @@ class AccountBot:
         if act == 'click':
             if not DRY_RUN:
                 win_input.click_abs(ax, ay)
-            self.next_ui = now + UI_CLICK_DELAY
+            # Play Now требует длиннее паузы — после клика грузится сервер-лист
+            self.next_ui = now + (UI_PLAY_NOW_DELAY
+                                  if action.get('action_type') == 'play_now'
+                                  else UI_CLICK_DELAY)
         elif act == 'scroll':
             # Фокус-клик ТОЛЬКО если reconnect дал безопасную точку (заголовок).
             # Нет focus_x -> заголовок не распознан -> НЕ кликаем (иначе попадём

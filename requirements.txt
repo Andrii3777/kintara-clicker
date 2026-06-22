@@ -4,3 +4,4 @@ numpy
 keyboard
 mss
 rapidocr_onnxruntime   # OCR для перезахода на сервер (common/reconnect.py)
+anthropic              # Claude API для решения капчи (common/captcha.py)
