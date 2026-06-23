@@ -21,7 +21,7 @@ import os
 import cv2
 import numpy as np
 
-from stone_detector import detect_stones
+from stone_detector import detect_stones, detect_metals
 
 
 def grab_screen(monitor_index=1):
@@ -32,12 +32,16 @@ def grab_screen(monitor_index=1):
         return cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
 
 
-def draw_debug(bgr, stones, rejected):
+def draw_debug(bgr, stones, metals, rejected_s, rejected_m):
     out = bgr.copy()
-    for (x, y, w, h), reason in rejected:
+    for (x, y, w, h), reason in rejected_s:
         cv2.rectangle(out, (x, y), (x + w, y + h), (0, 0, 255), 1)
         cv2.putText(out, reason, (x, y - 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+    for (x, y, w, h), reason in rejected_m:
+        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 100, 255), 1)
+        cv2.putText(out, f"m:{reason}", (x, y - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 100, 255), 1)
     for s in stones:
         x, y, w, h = s['box']
         cx, cy = s['click']
@@ -45,19 +49,33 @@ def draw_debug(bgr, stones, rejected):
         cv2.circle(out, (cx, cy), 4, (255, 0, 0), -1)
         cv2.putText(out, f"{s['grass_ring']:.2f}", (x, y - 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+    for m in metals:
+        x, y, w, h = m['box']
+        cx, cy = m['click']
+        cv2.rectangle(out, (x, y), (x + w, y + h), (255, 200, 0), 2)   # голубой
+        cv2.circle(out, (cx, cy), 4, (255, 100, 0), -1)
+        cv2.putText(out, f"M {m['snow_ring']:.2f}", (x, y - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 200, 0), 1)
     return out
 
 
 def run_on(bgr, stem):
-    stones, rejected, stone, grass = detect_stones(bgr)
-    print(f"[{stem}] камней: {len(stones)}  отклонено: {len(rejected)}")
+    stones, rej_s, stone, grass = detect_stones(bgr)
+    metals, rej_m, metal, snow  = detect_metals(bgr)
+    print(f"[{stem}] камней: {len(stones)}  металла: {len(metals)}  "
+          f"отклонено_камень: {len(rej_s)}  отклонено_металл: {len(rej_m)}")
     for s in stones:
-        print(f"    {s['click']} area={s['area']} extent={s['extent']} "
+        print(f"  [stone] {s['click']} area={s['area']} extent={s['extent']} "
               f"grass_ring={s['grass_ring']} vstd={s['vstd']} sstd={s['sstd']}")
-    cv2.imwrite(f"{stem}_input.png", bgr)   # СЫРОЙ кадр — чтоб тюнить на нём же
-    cv2.imwrite(f"{stem}_result.png", draw_debug(bgr, stones, rejected))
+    for m in metals:
+        print(f"  [metal] {m['click']} area={m['area']} extent={m['extent']} "
+              f"snow_ring={m['snow_ring']} vstd={m['vstd']} sstd={m['sstd']}")
+    cv2.imwrite(f"{stem}_input.png", bgr)
+    cv2.imwrite(f"{stem}_result.png", draw_debug(bgr, stones, metals, rej_s, rej_m))
     cv2.imwrite(f"{stem}_stone_mask.png", stone)
     cv2.imwrite(f"{stem}_grass_mask.png", grass)
+    cv2.imwrite(f"{stem}_metal_mask.png", metal)
+    cv2.imwrite(f"{stem}_snow_mask.png", snow)
 
 
 def main():

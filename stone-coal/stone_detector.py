@@ -2,14 +2,17 @@
 """
 stone_detector.py
 =================
-Ядро детекции КАМНЕЙ. БЕЗ кликов, БЕЗ захвата экрана.
-Дать картинку BGR -> вернуть список камней.
+Ядро детекции КАМНЕЙ и МЕТАЛЛА. БЕЗ кликов, БЕЗ захвата экрана.
+Дать картинку BGR -> вернуть список камней / металла.
 
 Идея детекции (по замерам реальных пикселей примеров в images-examples/):
   Камень = СЕРЫЙ/бежевый воксель-блоб на траве. Главный признак — НИЗКАЯ
   насыщенность (S~34-51) при тёплом H~20-26 и средней V~60-110. Трава наоборот
   яркая и насыщенная (S>125), ствол дерева того же H но S>150. Значит камень
   ловится "тёплый серый = низкая S".
+
+  Металл = похожий серый блоб, но лежит на СНЕГУ (белый фон, S≈0, V>180).
+  Проверка окружения: снег вместо травы.
 
   Проблема: в городе серого МНОГО (крыши, брусчатка, грунт, заборы). Их
   отсекаем тем что камень = КОМПАКТНЫЙ блоб, ОКРУЖЁННЫЙ ТРАВОЙ. Брусчатка/крыша
@@ -73,12 +76,45 @@ GRASS_RING_MIN = 0.06    # доля травы в кольце чтоб засч
 STONE_VSTD_MIN = 9.5     # порог разброса яркости
 STONE_SSTD_MIN = 5.5     # порог разброса насыщенности
 
+# --- Цвет МЕТАЛЛА в HSV ---
+# Металл = ХОЛОДНО-СЕРЫЙ блоб на снегу. Замеры пикселей рудных блобов:
+#   H=105-120, S=15-50, V=75-115  (холодный/синеватый серый, темнее снега)
+# Снег: H=100-115, S=0-35, V=175-215 (ярче, ниже S)
+# Ключ: V<145 отделяет металл от снега (V>165).
+METAL_LOWER = (95, 12, 65)
+METAL_UPPER = (128, 65, 145)
+
+# --- Снег (для проверки "металл окружён снегом") ---
+# Снег: холодный, ахроматический, очень яркий. H=95-120, S=0-40, V>165.
+SNOW_LOWER = (95,  0, 162)
+SNOW_UPPER = (125, 42, 255)
+
+# --- Фильтры контура МЕТАЛЛА (отдельные от камня — блобы металла мельче) ---
+MIN_METAL_AREA = 60    # металл мелкий (60-300 px в типичном разрешении)
+MAX_METAL_AREA = 600   # больше — UI/строение (счётчик сервера -> выкид)
+
+# --- Проверка "металл рядом со снегом" (аналог GRASS_RING_MIN) ---
+# Металл часто в кластерах -> соседний блоб не даёт снега в кольце.
+# Низкий порог 0.03 — хватит угла кластера.
+SNOW_RING_MIN = 0.05   # доля снега в кольце вокруг бокса металла
+
+# --- Проверка "рядом НЕТ здания" ---
+# Бочки/ящики/основание здания: в кольце тёмные СЕРЫЕ пиксели (V<75, S<40).
+# Стволы деревьев тоже тёмные (V<80), но КОРИЧНЕВЫЕ (S≈100-200) -> не попадают.
+# Проверяем ОБА условия: V < BUILDING_DARK_V AND S < BUILDING_DARK_S
+# Замеры у здания: тёмно-серые стены S=10-30 -> дают dark_ring>0.09.
+# Реальный металл у деревьев: стволы S>80 -> не считаются -> dark_ring≈0.
+BUILDING_DARK_V = 75       # V ниже этого = тёмный пиксель
+BUILDING_DARK_S = 40       # AND S ниже этого = именно серый/каменный, не коричневый ствол
+DARK_RING_MAX = 0.09       # порог доли здание-пикселей в кольце
+DARK_SNOW_MIN = 0.50       # если snow >= этого — достаточно открытая поляна, не здание
+
 # --- Зоны UI которые игнорим (доли 0..1: x1,y1,x2,y2) ---
 IGNORE_ZONES = [
-    (0.0, 0.90, 1.0, 1.0),    # хотбар снизу
+    (0.0, 0.74, 1.0, 1.0),    # хотбар снизу (на этом мониторе 2560x1600 hotbar при y≈75%)
     (0.78, 0.0, 1.0, 0.20),   # миникарта справа сверху
     (0.0, 0.0, 0.12, 0.06),   # ярлык сервера слева сверху
-    (0.92, 0.10, 1.0, 0.55),  # колонка иконок справа
+    (0.88, 0.10, 1.0, 0.55),  # колонка иконок справа (расширено с 0.92)
 ]
 
 
@@ -191,6 +227,133 @@ def detect_stones(bgr):
     return stones, rejected, stone, grass
 
 
+# ============================================================
+# Детекция МЕТАЛЛА (серый блоб на снегу)
+# ============================================================
+
+def _dark_ring_ratio(vchan, schan, box, W, H):
+    """Доля пикселей ЗДАНИЯ в кольце: тёмные (V<BUILDING_DARK_V) И серые (S<BUILDING_DARK_S).
+    Стволы деревьев тёмные но коричневые (S>80) -> не считаются -> метал у деревьев не режется.
+    """
+    x, y, w, h = box
+    rx1, ry1 = max(0, x - RING_PAD), max(0, y - RING_PAD)
+    rx2, ry2 = min(W, x + w + RING_PAD), min(H, y + h + RING_PAD)
+    outer_v = vchan[ry1:ry2, rx1:rx2]
+    outer_s = schan[ry1:ry2, rx1:rx2]
+    if outer_v.size == 0:
+        return 0.0
+    inner_area = w * h
+    ring_area = outer_v.size - inner_area
+    if ring_area <= 0:
+        return 0.0
+    ix1, iy1 = x - rx1, y - ry1
+    building = (outer_v < BUILDING_DARK_V) & (outer_s < BUILDING_DARK_S)
+    building_outer = int(np.sum(building))
+    building_inner = int(np.sum(building[iy1:iy1 + h, ix1:ix1 + w]))
+    return max(0.0, building_outer - building_inner) / ring_area
+
+
+def _snow_ring_ratio(snow, box, W, H):
+    """Доля снега в кольце вокруг бокса металла (металл на снегу -> высокая)."""
+    x, y, w, h = box
+    rx1, ry1 = max(0, x - RING_PAD), max(0, y - RING_PAD)
+    rx2, ry2 = min(W, x + w + RING_PAD), min(H, y + h + RING_PAD)
+    outer = snow[ry1:ry2, rx1:rx2]
+    if outer.size == 0:
+        return 0.0
+    inner_area = w * h
+    ring_area = outer.size - inner_area
+    if ring_area <= 0:
+        return float(np.count_nonzero(outer)) / outer.size
+    ix1, iy1 = x - rx1, y - ry1
+    ring_snow = int(np.count_nonzero(outer)) - \
+        int(np.count_nonzero(outer[iy1:iy1 + h, ix1:ix1 + w]))
+    return max(0.0, ring_snow) / ring_area
+
+
+def detect_metals(bgr):
+    """
+    Вход: картинка BGR. Выход: (metals, rejected, metal_mask, snow_mask).
+    Каждый металл: {'box':(x,y,w,h), 'click':(cx,cy), 'area':int,
+                    'extent':float, 'snow_ring':float, 'type':'metal'}.
+
+    Логика: тот же пайплайн что detect_stones, но:
+      - маска цвета: METAL_LOWER/METAL_UPPER (серый, схоже с камнем)
+      - проверка окружения: СНЕГ вместо травы (SNOW_RING_MIN)
+    ВАЖНО: HSV металла требует калибровки на реальном скрине снежного биома!
+    """
+    H, W = bgr.shape[:2]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+    metal = cv2.inRange(hsv, np.array(METAL_LOWER), np.array(METAL_UPPER))
+    snow  = cv2.inRange(hsv, np.array(SNOW_LOWER),  np.array(SNOW_UPPER))
+
+    k = np.ones((MORPH_KERNEL, MORPH_KERNEL), np.uint8)
+    metal = cv2.morphologyEx(metal, cv2.MORPH_CLOSE, k, iterations=STONE_CLOSE_ITERS)
+    metal = cv2.morphologyEx(metal, cv2.MORPH_OPEN,  k, iterations=STONE_OPEN_ITERS)
+
+    vchan = hsv[:, :, 2]
+    schan = hsv[:, :, 1]
+
+    contours, _ = cv2.findContours(metal, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    metals = []
+    rejected = []
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        x, y, w, h = cv2.boundingRect(c)
+
+        if area < MIN_METAL_AREA:
+            continue
+        if area > MAX_METAL_AREA:
+            rejected.append(((x, y, w, h), "size"))
+            continue
+
+        extent = area / float(w * h) if w * h > 0 else 0.0
+        aspect = max(w / float(h), h / float(w)) if w > 0 and h > 0 else 99
+        if extent < MIN_EXTENT or aspect > MAX_ASPECT:
+            rejected.append(((x, y, w, h), "shape"))
+            continue
+
+        cx, cy = x + w // 2, y + h // 2
+        if _in_ignore_zone(cx, cy, W, H):
+            rejected.append(((x, y, w, h), "ui"))
+            continue
+
+        sring = _snow_ring_ratio(snow, (x, y, w, h), W, H)
+        if sring < SNOW_RING_MIN:
+            rejected.append(((x, y, w, h), "no_snow"))
+            continue
+
+        dring = _dark_ring_ratio(vchan, schan, (x, y, w, h), W, H)
+        if dring > DARK_RING_MAX and sring < DARK_SNOW_MIN:
+            rejected.append(((x, y, w, h), "near_building"))
+            continue
+
+        roi_mask = metal[y:y + h, x:x + w]
+        roi_v = vchan[y:y + h, x:x + w][roi_mask > 0]
+        roi_s = schan[y:y + h, x:x + w][roi_mask > 0]
+        vstd = float(np.std(roi_v)) if roi_v.size >= 5 else 0.0
+        sstd = float(np.std(roi_s)) if roi_s.size >= 5 else 0.0
+        if vstd < STONE_VSTD_MIN and sstd < STONE_SSTD_MIN:
+            rejected.append(((x, y, w, h), "flat"))
+            continue
+
+        metals.append({
+            'box':       (x, y, w, h),
+            'click':     (cx, cy),
+            'area':      int(area),
+            'extent':    round(extent, 2),
+            'snow_ring': round(sring, 2),
+            'vstd':      round(vstd, 1),
+            'sstd':      round(sstd, 1),
+            'type':      'metal',
+        })
+
+    return metals, rejected, metal, snow
+
+
 # --- Сигнал добычи камня ---
 # Замер (diag_capture в живой игре): зелёного ГЛОУ у камня НЕТ (в отличие от
 # дерева). Сигнал ИНВЕРТИРОВАН: перс приходит и ВСТАЁТ на камень -> заслоняет
@@ -209,6 +372,20 @@ def stone_px(bgr, cx, cy, r):
         return 0
     hsv = cv2.cvtColor(bgr[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
     m = cv2.inRange(hsv, np.array(STONE_LOWER), np.array(STONE_UPPER))
+    return int(np.count_nonzero(m))
+
+
+def metal_px(bgr, cx, cy, r):
+    """Кол-во пикселей цвета МЕТАЛЛА в зоне радиусом r вокруг (cx,cy).
+    Сигнал добычи — тот же инвертированный принцип что у камня (заслон телом).
+    """
+    H, W = bgr.shape[:2]
+    x1, x2 = max(0, cx - r), min(W, cx + r)
+    y1, y2 = max(0, cy - r), min(H, cy + r)
+    if x2 <= x1 or y2 <= y1:
+        return 0
+    hsv = cv2.cvtColor(bgr[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
+    m = cv2.inRange(hsv, np.array(METAL_LOWER), np.array(METAL_UPPER))
     return int(np.count_nonzero(m))
 
 

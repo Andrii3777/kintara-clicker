@@ -52,7 +52,7 @@ win_input.set_dpi_aware()
 
 import keyboard
 
-from stone_detector import detect_stones, stone_px
+from stone_detector import detect_stones, stone_px, detect_metals, metal_px
 from reconnect import load_templates, emergency_ui_check
 from pan import Panner, zoom_map
 from tool_select import select_tool
@@ -110,7 +110,8 @@ APPEAR_BASE = 3.0
 WALK_SEC_PER_PX = 0.020
 APPEAR_MAX = 6.0
 VANISH_CONFIRM = 2
-HARD_CAP = 8.0
+ENGAGE_MINE_TIME = 7.0     # сек после engage -> считаем добытым (ресурс исчез)
+HARD_CAP = 10.0
 POST_CHOP_PAUSE = (0.1, 0.3)
 DRY_WAIT = 2.0             # в DRY_RUN держим «добычу» столько
 
@@ -134,7 +135,8 @@ ZOOM_TIMES = 6             # сколько полных прокрутов
 # --- Отбор/выбор цели ---
 # ВНИМАНИЕ: квадрант = 1/4 экрана -> камни мельче. Порог площади, возможно,
 # надо уменьшить против одиночного бота. Откалибруй на debug-кадре квадранта.
-MIN_CLICK_STONE_AREA = 200
+MIN_CLICK_STONE_AREA = 200   # камень/уголь
+MIN_CLICK_METAL_AREA = 80    # металл (блобы мельче)
 CHAR_ANCHOR = (0.42, 0.40)   # доли ВНУТРИ квадранта (перс ~ центр окна)
 SAME_STONE_R = 18
 COOLDOWN_SEC = 12.0
@@ -199,8 +201,12 @@ def grab_region(region):
     return cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
 
 
-def pick_confident(stones):
-    return [s for s in stones if s['area'] >= MIN_CLICK_STONE_AREA]
+def pick_confident(targets):
+    def _ok(s):
+        if s.get('type') == 'metal':
+            return s['area'] >= MIN_CLICK_METAL_AREA
+        return s['area'] >= MIN_CLICK_STONE_AREA
+    return [s for s in targets if _ok(s)]
 
 
 def choose_target(stones, last_pos, anchor_px, recent, blacklist):
@@ -281,8 +287,10 @@ class AccountBot:
         return (self.region['left'] + local_xy[0],
                 self.region['top'] + local_xy[1])
 
-    def _stone_px(self, bgr):
+    def _resource_px(self, bgr):
         cx, cy = self.target['click']
+        if self.target.get('type') == 'metal':
+            return metal_px(bgr, cx, cy, STONE_GLOW_R)
         return stone_px(bgr, cx, cy, STONE_GLOW_R)
 
     def _expire_memory(self, now):
@@ -397,15 +405,18 @@ class AccountBot:
         anchor = (int(CHAR_ANCHOR[0] * W), int(CHAR_ANCHOR[1] * H))
 
         stones, _, _, _ = detect_stones(bgr)
-        stones = pick_confident(stones)
+        metals, _, _, _ = detect_metals(bgr)
+        for s in stones:
+            s.setdefault('type', 'stone')
+        all_targets = pick_confident(stones + metals)
 
         recent_pts = [p for (p, _) in self.recent]
         black_pts = [p for (p, _) in self.blacklist]
-        target = choose_target(stones, self.last_pos, anchor,
-                               recent_pts, black_pts) if stones else None
+        target = choose_target(all_targets, self.last_pos, anchor,
+                               recent_pts, black_pts) if all_targets else None
 
         if target is None:
-            reason = "нет камней" if not stones else "все в чёрном списке"
+            reason = "нет целей" if not all_targets else "все в чёрном списке"
             if not PAN_ENABLED:
                 self.resume_at = now + 1.0   # пан выкл -> ждём на месте
                 return False
@@ -422,7 +433,8 @@ class AccountBot:
         d = 0.0 if self.last_pos is None else dist(self.last_pos, target['click'])
 
         ax, ay = self._abs(target['click'])
-        print(f"[{self.tag} #{self.clicks}] камень@{target['click']} "
+        rtype = target.get('type', 'stone')
+        print(f"[{self.tag} #{self.clicks}] {rtype}@{target['click']} "
               f"area={target['area']} dist={d:.0f} -> click({ax},{ay})")
 
         if not DRY_RUN:
@@ -442,21 +454,23 @@ class AccountBot:
         self.hard_deadline = now + HARD_CAP
         self.appear_deadline = min(now + APPEAR_BASE + d * WALK_SEC_PER_PX,
                                    now + APPEAR_MAX, self.hard_deadline)
-        self.base = max(1, self._stone_px(bgr))  # камень виден, перс ещё идёт
+        self.base = max(1, self._resource_px(bgr))  # ресурс виден, перс ещё идёт
         self.drop_thr = self.base * ENGAGE_DROP_FRAC
         self.recover_thr = self.base * RECOVER_FRAC
         self.lowest = self.base
         self.last = self.base
         self.back = 0
+        self.engage_time = None  # выставляется при переходе в WAIT_RECOVER
         self.state = WAIT_ENGAGE
         return False
 
     def _tick_engage(self, now):
         bgr = grab_region(self.region)
-        self.last = self._stone_px(bgr)
+        self.last = self._resource_px(bgr)
         self.lowest = min(self.lowest, self.last)
         if self.last <= self.drop_thr:
             self.back = 0
+            self.engage_time = now  # фиксируем момент прихода перса
             self.state = WAIT_RECOVER
             return
         if now >= self.appear_deadline:
@@ -474,8 +488,16 @@ class AccountBot:
             self.resume_at = now + random.uniform(*POST_CHOP_PAUSE)
             self.state = SCAN
             return
+        # фолбэк: ресурс исчез (px не восстанавливается) — достаточно времени прошло
+        if self.engage_time and now >= self.engage_time + ENGAGE_MINE_TIME:
+            took = now - self.t0
+            print(f"[{self.tag} #{self.clicks}] mined(depleted) за {took:.1f}s "
+                  f"(base={self.base} min={self.lowest} last={self.last})")
+            self.resume_at = now + random.uniform(*POST_CHOP_PAUSE)
+            self.state = SCAN
+            return
         bgr = grab_region(self.region)
-        self.last = self._stone_px(bgr)
+        self.last = self._resource_px(bgr)
         self.lowest = min(self.lowest, self.last)
         if self.last >= self.recover_thr:
             self.back += 1
