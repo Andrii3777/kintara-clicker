@@ -39,6 +39,7 @@ import random
 
 import cv2
 import numpy as np
+import mss as _mss
 
 # DPI-aware ПЕРВЫМ делом — до mss/любого захвата.
 # Бутстрап путей: ../common (win_input, общий) и ../tree (tree_detector, ядро CV).
@@ -64,6 +65,12 @@ from tool_select import select_tool
 
 DRY_RUN = False            # True = печать без клика (СНАЧАЛА проверь так!)
 MONITOR_INDEX = 1          # какой монитор делить на 2x2
+
+# --- CPU-оптимизация ---
+# Даунскейл кадра ПЕРЕД детекцией. 0.5 = 4x меньше пикселей -> CV в 4x быстрее.
+# Координаты click/trunk_area/crown_area автоматически масштабируются обратно.
+# 1.0 = отключено.
+DETECT_SCALE = 0.5
 
 # --- Раскладка квадрантов ---
 # Авто 2x2 монитора. Поджимаем рамки внутрь на REGION_INSET долю, чтобы НЕ
@@ -160,15 +167,23 @@ def dist(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+_sct = None   # персистентный mss — не создаём новый контекст на каждый захват
+
+
+def _get_sct():
+    global _sct
+    if _sct is None:
+        _sct = _mss.mss()
+    return _sct
+
+
 def build_regions():
     """
     Разбить MONITOR_INDEX на 4 квадранта 2x2 и оставить только АКТИВНЫЕ
     (QUADRANT_*). Каждый регион — dict в АБСОЛЮТНЫХ координатах виртуального стола
     (left/top уже со смещением монитора), как ждёт mss.grab и win_input.
     """
-    import mss
-    with mss.mss() as sct:
-        mon = sct.monitors[MONITOR_INDEX]
+    mon = _get_sct().monitors[MONITOR_INDEX]
     L, T, W, H = mon['left'], mon['top'], mon['width'], mon['height']
     hw, hh = W // 2, H // 2
     ins_x, ins_y = int(hw * REGION_INSET), int(hh * REGION_INSET)
@@ -194,12 +209,24 @@ def build_regions():
 
 def grab_region(region):
     """Захват одного региона -> BGR. Координаты региона уже абсолютные."""
-    import mss
-    with mss.mss() as sct:
-        shot = np.array(sct.grab({'left': region['left'], 'top': region['top'],
-                                  'width': region['width'],
-                                  'height': region['height']}))
+    shot = np.array(_get_sct().grab({'left': region['left'], 'top': region['top'],
+                                     'width': region['width'],
+                                     'height': region['height']}))
     return cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
+
+
+def _upscale_trees(trees, scale):
+    """Масштабировать click/trunk_area/crown_area из уменьшённого кадра к полному."""
+    if scale >= 1.0:
+        return trees
+    inv = 1.0 / scale
+    inv2 = inv * inv
+    for t in trees:
+        cx, cy = t['click']
+        t['click'] = (int(cx * inv), int(cy * inv))
+        t['trunk_area'] = int(t['trunk_area'] * inv2)
+        t['crown_area'] = int(t['crown_area'] * inv2)
+    return trees
 
 
 def pick_confident(trees):
@@ -407,7 +434,9 @@ class AccountBot:
         H, W = bgr.shape[:2]
         anchor = (int(CHAR_ANCHOR[0] * W), int(CHAR_ANCHOR[1] * H))
 
-        trees, _, _, _ = detect_trees(bgr)
+        det = cv2.resize(bgr, (0, 0), fx=DETECT_SCALE, fy=DETECT_SCALE) if DETECT_SCALE < 1.0 else bgr
+        trees, _, _, _ = detect_trees(det)
+        _upscale_trees(trees, DETECT_SCALE)
         trees = pick_confident(trees)
 
         recent_pts = [p for (p, _) in self.recent]

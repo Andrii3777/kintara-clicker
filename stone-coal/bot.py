@@ -29,6 +29,7 @@ import random
 
 import cv2
 import numpy as np
+import mss as _mss
 
 # DPI-aware ПЕРВЫМ делом — до mss/любого захвата. Иначе mss выставит
 # system-DPI по первому монитору и клики по второму монитору уедут.
@@ -51,6 +52,12 @@ from tool_select import select_tool
 # ============================================================
 
 DRY_RUN = False            # True = печать без клика (СНАЧАЛА проверь так!)
+
+# --- CPU-оптимизация ---
+# Даунскейл кадра ПЕРЕД детекцией. 0.5 = 4x меньше пикселей -> CV в 4x быстрее.
+# Координаты click/area автоматически масштабируются обратно к полному разрешению.
+# 1.0 = отключено (полное разрешение, старое поведение).
+DETECT_SCALE = 0.5
 
 # Какой монитор сканировать. mss: [1]=первый, [2]=второй, [0]=все вместе.
 # Узнать свои: python -c "import mss;[print(i,m) for i,m in enumerate(mss.mss().monitors)]"
@@ -146,13 +153,29 @@ UI_SCROLL_NOTCHES = -1       # шаг колеса: <0 вниз (1 щелчок)
 # Утилиты
 # ============================================================
 
+_sct = None   # персистентный mss — не создаём новый контекст на каждый захват
+
 def grab_screen():
     """Захват выбранного монитора -> BGR для OpenCV (через mss, быстро)."""
-    import mss
-    with mss.mss() as sct:
-        mon = sct.monitors[MONITOR_INDEX]
-        shot = np.array(sct.grab(mon))
-        return cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR), mon
+    global _sct
+    if _sct is None:
+        _sct = _mss.mss()
+    mon = _sct.monitors[MONITOR_INDEX]
+    shot = np.array(_sct.grab(mon))
+    return cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR), mon
+
+
+def _upscale_stones(stones, scale):
+    """Масштабировать click/area из уменьшённого кадра к полному разрешению."""
+    if scale >= 1.0:
+        return stones
+    inv = 1.0 / scale
+    inv2 = inv * inv
+    for s in stones:
+        cx, cy = s['click']
+        s['click'] = (int(cx * inv), int(cy * inv))
+        s['area'] = int(s['area'] * inv2)
+    return stones
 
 
 def dist(a, b):
@@ -398,8 +421,11 @@ def main():
         H, W = bgr.shape[:2]
         anchor_px = (int(CHAR_ANCHOR[0] * W), int(CHAR_ANCHOR[1] * H))
 
-        stones, _, _, _ = detect_stones(bgr)
-        metals, _, _, _ = detect_metals(bgr)
+        det = cv2.resize(bgr, (0, 0), fx=DETECT_SCALE, fy=DETECT_SCALE) if DETECT_SCALE < 1.0 else bgr
+        stones, _, _, _ = detect_stones(det)
+        metals, _, _, _ = detect_metals(det)
+        _upscale_stones(stones, DETECT_SCALE)
+        _upscale_stones(metals, DETECT_SCALE)
         # type уже проставлен в detect_metals; добавляем для камней
         for s in stones:
             s.setdefault('type', 'stone')

@@ -39,6 +39,7 @@ import random
 
 import cv2
 import numpy as np
+import mss as _mss
 
 # DPI-aware ПЕРВЫМ делом — до mss/любого захвата.
 # Бутстрап путей: ../common (win_input, общий) и ../stone-coal (stone_detector).
@@ -64,6 +65,12 @@ from tool_select import select_tool
 
 DRY_RUN = False            # True = печать без клика (СНАЧАЛА проверь так!)
 MONITOR_INDEX = 1          # какой монитор делить на 2x2
+
+# --- CPU-оптимизация ---
+# Даунскейл кадра ПЕРЕД детекцией. 0.5 = 4x меньше пикселей -> CV в 4x быстрее.
+# Координаты click/area автоматически масштабируются обратно к полному разрешению.
+# 1.0 = отключено.
+DETECT_SCALE = 0.5
 
 # --- Раскладка квадрантов ---
 REGION_INSET = 0.0         # 0..0.2; >0 если по краям квадранта мусор/чужое окно
@@ -159,15 +166,23 @@ def dist(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+_sct = None   # персистентный mss — не создаём новый контекст на каждый захват
+
+
+def _get_sct():
+    global _sct
+    if _sct is None:
+        _sct = _mss.mss()
+    return _sct
+
+
 def build_regions():
     """
     Разбить MONITOR_INDEX на 4 квадранта 2x2 и оставить только АКТИВНЫЕ
     (QUADRANT_*). Каждый регион — dict в АБСОЛЮТНЫХ координатах виртуального стола
     (left/top уже со смещением монитора).
     """
-    import mss
-    with mss.mss() as sct:
-        mon = sct.monitors[MONITOR_INDEX]
+    mon = _get_sct().monitors[MONITOR_INDEX]
     L, T, W, H = mon['left'], mon['top'], mon['width'], mon['height']
     hw, hh = W // 2, H // 2
     ins_x, ins_y = int(hw * REGION_INSET), int(hh * REGION_INSET)
@@ -193,12 +208,23 @@ def build_regions():
 
 def grab_region(region):
     """Захват одного региона -> BGR. Координаты региона уже абсолютные."""
-    import mss
-    with mss.mss() as sct:
-        shot = np.array(sct.grab({'left': region['left'], 'top': region['top'],
-                                  'width': region['width'],
-                                  'height': region['height']}))
+    shot = np.array(_get_sct().grab({'left': region['left'], 'top': region['top'],
+                                     'width': region['width'],
+                                     'height': region['height']}))
     return cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
+
+
+def _upscale_stones(stones, scale):
+    """Масштабировать click/area из уменьшённого кадра к полному разрешению."""
+    if scale >= 1.0:
+        return stones
+    inv = 1.0 / scale
+    inv2 = inv * inv
+    for s in stones:
+        cx, cy = s['click']
+        s['click'] = (int(cx * inv), int(cy * inv))
+        s['area'] = int(s['area'] * inv2)
+    return stones
 
 
 def pick_confident(targets):
@@ -404,8 +430,11 @@ class AccountBot:
         H, W = bgr.shape[:2]
         anchor = (int(CHAR_ANCHOR[0] * W), int(CHAR_ANCHOR[1] * H))
 
-        stones, _, _, _ = detect_stones(bgr)
-        metals, _, _, _ = detect_metals(bgr)
+        det = cv2.resize(bgr, (0, 0), fx=DETECT_SCALE, fy=DETECT_SCALE) if DETECT_SCALE < 1.0 else bgr
+        stones, _, _, _ = detect_stones(det)
+        metals, _, _, _ = detect_metals(det)
+        _upscale_stones(stones, DETECT_SCALE)
+        _upscale_stones(metals, DETECT_SCALE)
         for s in stones:
             s.setdefault('type', 'stone')
         all_targets = pick_confident(stones + metals)
